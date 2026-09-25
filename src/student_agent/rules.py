@@ -65,6 +65,45 @@ EVIDENCE_ORDER = (
     "shipment",
     "policy",
 )
+# Which evidence each claimed issue needs. The coordinator plans from the customer's claim and
+# widens to FULL_PLAN if the claim is not confirmed, so every conclusion stays evidence-backed
+# while the call count stays low.
+CLAIM_PLAN = {
+    "canceled_order_paid": ("order", "items", "timeline"),
+    "unavailable_order_paid": ("order", "items", "timeline"),
+    "late_delivery_seller": ("order", "items", "shipment"),
+    "late_delivery_logistics": ("order", "items", "shipment"),
+    "valid_split_payment": ("order", "items", "timeline"),
+    "payment_mismatch": ("order", "items", "timeline"),
+    "duplicate_charge": ("order", "items", "timeline"),
+    "refund_pending": ("order", "items", "timeline", "refunds"),
+    "refund_failed": ("order", "items", "timeline", "refunds"),
+}
+EXAMINE_ALL = ("order", "items", "timeline", "refunds", "shipment")
+FULL_PLAN = ("order", "items", "sellers", "payments", "timeline", "refunds", "shipment")
+NEUTRAL_PAYMENT = {
+    "captured_brl": None,
+    "duplicate": False,
+    "mismatch": False,
+    "split_sums": [],
+    "amounts": [],
+    "payment_refs": [],
+}
+NEUTRAL_REFUND = {"pending": False, "failed": False}
+NEUTRAL_SHIPMENT = {"late_actor": None, "event_contradicted": False, "shipment_id": None}
+
+
+class NeedsWiderEvidence(Exception):
+    """The claimed issue is not confirmed by the evidence fetched so far."""
+
+
+def plan_for(case: dict[str, Any], widen: bool = False) -> tuple[str, ...]:
+    if widen:
+        return FULL_PLAN
+    claimed = claimed_issue(case)
+    return CLAIM_PLAN.get(claimed, EXAMINE_ALL) if claimed else EXAMINE_ALL
+
+
 PAYMENT_ISSUES = {
     "canceled_order_paid",
     "unavailable_order_paid",
@@ -187,7 +226,7 @@ def supported_issues(
     order: dict[str, Any], payment: dict[str, Any], refund: dict[str, Any], ship: dict[str, Any]
 ) -> set[str]:
     found: set[str] = set()
-    paid = payment["captured_brl"] > 0
+    paid = (payment["captured_brl"] or 0) > 0
     if order["status"] == "canceled" and paid:
         found.add("canceled_order_paid")
     if order["status"] == "unavailable" and paid:
@@ -230,11 +269,16 @@ def decide(
     refund: dict[str, Any],
     ship: dict[str, Any],
     policy: dict[str, Any],
+    full: bool = True,
 ) -> dict[str, Any]:
     supported = supported_issues(order, payment, refund, ship)
     claimed = claimed_issue(case)
+    if not full and claimed not in supported and claimed != "unsupported_claim":
+        raise NeedsWiderEvidence(claimed or "no claim")
     if claimed in supported:
-        issue, confidence = claimed, 0.95 if len(supported) == 1 else 0.85
+        issue = claimed
+        # only the claimed domain was examined unless full evidence was fetched
+        confidence = 0.85 if len(supported) > 1 else (0.95 if full else 0.9)
     elif claimed == "unsupported_claim" and not supported:
         issue, confidence = "unsupported_claim", 0.9
     elif supported:
@@ -256,7 +300,9 @@ def decide(
             }
         )
     known = {_money(value) for value in (*order["amounts"], *payment["amounts"])}
-    if refund > 0 and refund not in known:  # policy amount not backed by this case's evidence
+    if (
+        payment["amounts"] and refund > 0 and refund not in known
+    ):  # policy amount not backed by this case's evidence
         unresolved += 1
         conflicts.append(
             {
@@ -303,7 +349,10 @@ def _claim_assessments(
         if topic == "requested_full_refund":
             if decision["refund_brl"] <= 0:
                 verdict, evidence = "unsupported", money_refs
-            elif decision["refund_brl"] >= payment["captured_brl"]:
+            elif (
+                payment["captured_brl"] is not None
+                and decision["refund_brl"] >= payment["captured_brl"]
+            ):
                 verdict, evidence = "supported", money_refs
             else:
                 verdict, evidence = "partially_supported", money_refs

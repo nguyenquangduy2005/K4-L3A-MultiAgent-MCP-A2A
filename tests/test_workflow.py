@@ -241,7 +241,7 @@ def test_verifier_rejects_party_that_contradicts_the_issue(tmp_path: Path) -> No
 
 def test_confidence_drops_only_for_an_unbacked_refund_amount(tmp_path: Path) -> None:
     clean, _ = run_case(FakeGateway("canceled"), tmp_path)
-    assert clean["assessment"]["confidence"] == 0.95
+    assert clean["assessment"]["confidence"] == 0.9
     gateway = FakeGateway("canceled")
     gateway.data["get_payment_timeline"] = (
         "payment",
@@ -255,10 +255,29 @@ def test_confidence_drops_only_for_an_unbacked_refund_amount(tmp_path: Path) -> 
         [{**ITEM, "price": "90.00", "freight_value": "0.00"}],
     )
     doubtful, _ = run_case(gateway, tmp_path / "b")
-    assert doubtful["assessment"]["confidence"] == 0.9
+    assert doubtful["assessment"]["confidence"] == 0.85
     assert doubtful["data_conflicts"][0]["resolution_code"] == "POLICY_AMOUNT_NOT_IN_EVIDENCE"
 
 
 def test_output_cites_every_evidence_the_specialists_consumed(tmp_path: Path) -> None:
     output, events = run_case(FakeGateway("canceled"), tmp_path)
     assert set(output["evidence_refs"]) == set(consumed_refs(events))
+
+
+def test_claim_driven_plan_calls_only_the_tools_it_needs(tmp_path: Path) -> None:
+    gateway = FakeGateway("canceled")
+    run_case(gateway, tmp_path)
+    assert sorted(gateway.calls) == [
+        "get_order",
+        "get_order_items",
+        "get_payment_timeline",
+        "get_policy",
+    ]
+
+
+def test_unconfirmed_claim_widens_evidence_before_concluding(tmp_path: Path) -> None:
+    gateway = FakeGateway("delivered")  # the claimed cancellation is not backed by the order
+    output, events = run_case(gateway, tmp_path)
+    assert output["assessment"]["primary_issue"] == "unsupported_claim"
+    assert "get_shipment_summary" in gateway.calls and "get_refund_timeline" in gateway.calls
+    assert '"decision_code":"widen_evidence"' in "\n".join(events)

@@ -108,6 +108,17 @@ def _envelope(
 # --- agents ---------------------------------------------------------------------------------
 
 
+AGENT_KEYS = {
+    "order-item-agent": ("order", "items", "sellers"),
+    "payment-agent": ("payments", "timeline", "refunds"),
+    "shipment-agent": ("shipment",),
+}
+
+
+def _mine(state: CaseState, agent: str) -> list[str]:
+    return [key for key in state["plan"]["keys"] if key in AGENT_KEYS[agent]]
+
+
 async def coordinator(state: CaseState, config: RunnableConfig) -> dict[str, Any]:
     rt = _rt(config)
     case = state["case"]
@@ -115,14 +126,16 @@ async def coordinator(state: CaseState, config: RunnableConfig) -> dict[str, Any
     if replans:
         rt.collector.forget_failures()
     order_id = case.get("customer_request", {}).get("claimed_order_id")
-    plan = {"order_id": order_id, "policy_version": case.get("policy_version")}
-    for agent in ("order-item-agent", "payment-agent", "shipment-agent"):
-        rt.emit(
-            "task_assigned",
-            "coordinator",
-            target=agent,
-            decision_code="replan" if replans else "collect_evidence",
-        )
+    keys = list(rules.plan_for(case, widen=bool(replans)))
+    plan = {"order_id": order_id, "policy_version": case.get("policy_version"), "keys": keys}
+    for agent, group in AGENT_KEYS.items():
+        if any(key in keys for key in group):  # only agents with work are assigned
+            rt.emit(
+                "task_assigned",
+                "coordinator",
+                target=agent,
+                decision_code="replan" if replans else "collect_evidence",
+            )
     return {
         "plan": plan,
         "draft": None,
@@ -144,84 +157,86 @@ def _handoff(rt: Runtime, agent: str, keys: list[str]) -> dict[str, Any]:
     return {"messages": [_envelope(agent, "policy-agent", "result", rt.case_id, keys=keys)]}
 
 
+async def _collect(
+    rt: Runtime, agent: str, keys: list[str], **arguments: str
+) -> dict[str, Fetched]:
+    results = await asyncio.gather(*(rt.get(agent, key, **arguments) for key in keys))
+    return dict(zip(keys, results, strict=True))
+
+
 async def order_item_agent(state: CaseState, config: RunnableConfig) -> dict[str, Any]:
     rt, agent = _rt(config), "order-item-agent"
-    order_id = state["plan"]["order_id"]
-    if not order_id:
-        return _handoff(rt, agent, [])
-    order, items, _ = await asyncio.gather(
-        rt.get(agent, "order", order_id=order_id),
-        rt.get(agent, "items", order_id=order_id),
-        rt.get(agent, "sellers", order_id=order_id),
-    )
+    order_id, keys = state["plan"]["order_id"], _mine(state, agent)
+    if not order_id or not keys:
+        return {}
+    got = await _collect(rt, agent, keys, order_id=order_id)
     signals: dict[str, Any] = {}
-    if order.ok and items.ok:
-        signals["order"] = rules.order_signals(order.data, items.data)
-    return {**_handoff(rt, agent, ["order", "items", "sellers"]), "signals": signals}
+    if "order" in got and "items" in got and got["order"].ok and got["items"].ok:
+        signals["order"] = rules.order_signals(got["order"].data, got["items"].data)
+    return {**_handoff(rt, agent, keys), "signals": signals}
 
 
 async def payment_agent(state: CaseState, config: RunnableConfig) -> dict[str, Any]:
     rt, agent = _rt(config), "payment-agent"
-    order_id = state["plan"]["order_id"]
-    if not order_id:
-        return _handoff(rt, agent, [])
-    _, timeline, refunds = await asyncio.gather(
-        rt.get(agent, "payments", order_id=order_id),
-        rt.get(agent, "timeline", order_id=order_id),
-        rt.get(agent, "refunds", order_id=order_id),
-    )
+    order_id, keys = state["plan"]["order_id"], _mine(state, agent)
+    if not order_id or not keys:
+        return {}
+    got = await _collect(rt, agent, keys, order_id=order_id)
     signals: dict[str, Any] = {}
-    if timeline.ok:
-        signals["payment"] = rules.payment_signals(order_id, timeline.data)
+    if "timeline" in got and got["timeline"].ok:
+        signals["payment"] = rules.payment_signals(order_id, got["timeline"].data)
     # A tool error means the gateway holds no refund events for this order; only a transport
     # failure leaves the refund state unknown.
-    if refunds.ok or refunds.status == "tool_error":
+    refunds = got.get("refunds")
+    if refunds is not None and (refunds.ok or refunds.status == "tool_error"):
         signals["refund"] = rules.refund_signals(refunds.data if refunds.ok else None)
-    return {**_handoff(rt, agent, ["payments", "timeline", "refunds"]), "signals": signals}
+    return {**_handoff(rt, agent, keys), "signals": signals}
 
 
 async def shipment_agent(state: CaseState, config: RunnableConfig) -> dict[str, Any]:
     rt, agent = _rt(config), "shipment-agent"
-    order_id = state["plan"]["order_id"]
-    if not order_id:
-        return _handoff(rt, agent, [])
-    shipment = await rt.get(agent, "shipment", order_id=order_id)
-    signals = {"shipment": rules.shipment_signals(shipment.data)} if shipment.ok else {}
-    return {**_handoff(rt, agent, ["shipment"]), "signals": signals}
+    order_id, keys = state["plan"]["order_id"], _mine(state, agent)
+    if not order_id or not keys:
+        return {}
+    got = await _collect(rt, agent, keys, order_id=order_id)
+    signals = (
+        {"shipment": rules.shipment_signals(got["shipment"].data)} if got["shipment"].ok else {}
+    )
+    return {**_handoff(rt, agent, keys), "signals": signals}
 
 
 async def policy_agent(state: CaseState, config: RunnableConfig) -> dict[str, Any]:
     rt, agent = _rt(config), "policy-agent"
     case, signals = state["case"], state["signals"]
+    keys = set(state["plan"]["keys"])
     policy = await rt.get(agent, "policy", policy_version=state["plan"]["policy_version"] or "")
-    needed = ("order", "payment", "refund", "shipment")
+    needed = ["order"]
+    needed += ["payment"] if "timeline" in keys else []
+    needed += ["refund"] if "refunds" in keys else []
+    needed += ["shipment"] if "shipment" in keys else []
+    full = {"timeline", "refunds", "shipment"} <= keys
+    decision: dict[str, Any] | None = None
+    draft: dict[str, Any] | None = None
+    widen = False
     if policy.ok and all(name in signals for name in needed):
+        payment = signals.get("payment", rules.NEUTRAL_PAYMENT)
+        refund = signals.get("refund", rules.NEUTRAL_REFUND)
+        ship = signals.get("shipment", rules.NEUTRAL_SHIPMENT)
         try:
             decision = rules.decide(
-                case,
-                signals["order"],
-                signals["payment"],
-                signals["refund"],
-                signals["shipment"],
-                policy.data,
+                case, signals["order"], payment, refund, ship, policy.data, full
             )
-            draft = rules.build_output(
-                case,
-                decision,
-                signals["order"],
-                signals["payment"],
-                signals["shipment"],
-                rt.refs(),
-            )
+            draft = rules.build_output(case, decision, signals["order"], payment, ship, rt.refs())
+        except rules.NeedsWiderEvidence:
+            widen = True  # claim not confirmed by the targeted evidence: verifier will replan
         except (KeyError, TypeError, ValueError):
             decision, draft = None, None
-    else:
-        decision, draft = None, None
     if draft is None:
         missing = [name for name in needed if name not in signals]
         if not policy.ok:
             missing.append("policy")
-        code, attributes = "insufficient_evidence", {"missing": ",".join(missing)}
+        code = "widen_evidence" if widen else "insufficient_evidence"
+        attributes: dict[str, Any] = {"missing": ",".join(missing)}
     else:
         code = decision["issue"]
         attributes = {
@@ -266,7 +281,8 @@ def verify(
     refund = Decimal(str(money["recommended_refund_brl"]))
     if line_total != refund:
         problems.append("refund_total")
-    if refund > Decimal(str(signals["payment"]["captured_brl"])):
+    captured = signals.get("payment", {}).get("captured_brl")
+    if captured is not None and refund > Decimal(str(captured)):
         problems.append("refund_exceeds_paid")
     status = draft["assessment"]["case_status"]
     if status == "no_action" and (refund != 0 or money["refund_lines"]):
