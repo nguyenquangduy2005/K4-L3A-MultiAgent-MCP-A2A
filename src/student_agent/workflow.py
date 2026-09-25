@@ -324,7 +324,8 @@ async def _payment_agent(
         arguments=args,
     )
     mentions_refund = any("refund" in _event_kind(e) for e in store.payment_events())
-    if mentions_refund or topics & {"refund_pending", "refund_failed", "canceled_order_paid"}:
+    # Chỉ gọi khi có dấu hiệu refund: đơn không có refund làm tool này trả lỗi.
+    if mentions_refund or topics & {"refund_pending", "refund_failed"}:
         await _consume(
             gateway,
             trace,
@@ -516,7 +517,8 @@ def _detect_unfulfilled(store: CaseEvidence) -> Finding | None:
         confidence=0.95,
         evidence_amount=captured,
         tools=("get_order", *PAYMENT_TOOLS)
-        + (() if canceled else ("get_order_items", "get_sellers")),
+        + ("get_order_items",)
+        + (() if canceled else ("get_sellers",)),
     )
 
 
@@ -592,7 +594,7 @@ def _detect_refund_problem(store: CaseEvidence) -> Finding | None:
             cause_code="REFUND_PROCESSING_FAILED",
             confidence=0.95,
             evidence_amount=amount,
-            tools=("get_order", "get_refund_timeline", *PAYMENT_TOOLS),
+            tools=("get_order", "get_order_items", "get_refund_timeline", *PAYMENT_TOOLS),
         )
     if statuses & {"pending", "requested", "processing", "initiated"}:
         return Finding(
@@ -600,7 +602,7 @@ def _detect_refund_problem(store: CaseEvidence) -> Finding | None:
             cause_code="REFUND_NOT_SETTLED",
             confidence=0.95,
             evidence_amount=amount,
-            tools=("get_order", "get_refund_timeline", *PAYMENT_TOOLS),
+            tools=("get_order", "get_order_items", "get_refund_timeline", *PAYMENT_TOOLS),
         )
     return None
 
@@ -794,7 +796,7 @@ def _policy_decision(store: CaseEvidence, claimed: str | None) -> Finding:
             issue="unsupported_claim",
             cause_code="CLAIM_NOT_SUPPORTED_BY_EVIDENCE",
             confidence=0.9 if claimed in {None, "unsupported_claim"} else 0.7,
-            tools=("get_order", "get_shipment_summary", *PAYMENT_TOOLS),
+            tools=("get_order", "get_order_items", "get_shipment_summary", *PAYMENT_TOOLS),
         )
     elif claimed and claimed in ISSUE_TOPICS and claimed != finding.issue:
         # Evidence mâu thuẫn với claim: vẫn theo evidence, nhưng bớt chắc chắn.

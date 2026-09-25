@@ -38,7 +38,7 @@ Mọi specialist gọi MCP qua `EvidenceGateway.call`. Gateway luôn gửi kèm 
 | Coordinator | Case JSON | Lấy `claimed_order_id`, `claims`, `policy_version`; giao việc tuần tự; dựng output cuối | `case_received`, `task_assigned`, `case_finalized` |
 | order_agent | `case_id`, `order_id` | Trạng thái đơn, mốc thời gian, item, giá, phí vận chuyển, `shipping_limit_date` | handoff kèm ref + `order_status` |
 | seller_agent | `order_id` | Hồ sơ seller của các item | handoff kèm ref |
-| payment_agent | `order_id`, claim topics | Payment gốc, lifecycle event (authorized/captured/…); gọi `get_refund_timeline` khi timeline có refund hoặc claim liên quan refund/hủy đơn | handoff kèm ref |
+| payment_agent | `order_id`, claim topics | Payment gốc, lifecycle event (authorized/captured/…); gọi `get_refund_timeline` chỉ khi timeline có refund hoặc claim về refund (đơn không có refund làm tool này trả lỗi) | handoff kèm ref |
 | shipment_agent | `order_id` | Ngày giao carrier, ngày giao khách, ngày dự kiến, shipment id | handoff kèm ref |
 | policy_agent | `policy_version` + toàn bộ evidence | Tra policy công khai, chạy detector, chọn `primary_issue`, bên chịu trách nhiệm, refund, actions, confidence | `policy_decided`; handoff tới verifier |
 | verifier | Finding + evidence | Kiểm tra invariant (mục 6), chỉnh nếu vi phạm | `verification_completed` với mã điều chỉnh hoặc `INVARIANTS_OK` |
@@ -70,7 +70,7 @@ Không dùng `get_customer_history` và `get_product_context`: mọi case đều
 1. Specialist gọi `gateway.call(tool, case_id=..., order_id=...)`.
 2. Gateway đọc `structuredContent` (hoặc một text block JSON) và chạy `contracts.validate_evidence`.
 3. Ngay sau call, specialist emit `tool_result_consumed` với `tool_name`, đúng ref vừa nhận và `domain`.
-4. Policy agent chọn các tool **thật sự hỗ trợ** kết luận. `order` luôn được cite vì là thực thể gốc; cộng thêm nhóm theo issue: payment (payments + payment timeline) cho các issue về tiền và cho trễ giao (số tiền hoàn lấy từ capture), shipment + item cho trễ giao, seller khi seller chịu trách nhiệm, refund cho refund pending/failed, và policy khi policy quyết định action/số tiền. Chỉ ref của các tool đó được cite trong `evidence_refs` và `claim_assessments`; nếu các tool đó không có ref thì dùng domain liên quan (`ISSUE_DOMAINS`).
+4. Policy agent chọn các tool **thật sự hỗ trợ** kết luận. `order` và `order_items` được cite cho mọi issue về đơn hàng vì là thực thể gốc; cộng thêm nhóm theo issue: payment (payments + payment timeline) cho các issue về tiền và cho trễ giao (số tiền hoàn lấy từ capture), shipment + item cho trễ giao, seller khi seller chịu trách nhiệm, refund cho refund pending/failed, và policy khi policy quyết định action/số tiền. Chỉ ref của các tool đó được cite trong `evidence_refs` và `claim_assessments`; nếu các tool đó không có ref thì dùng domain liên quan (`ISSUE_DOMAINS`).
 5. Hệ thống không tự tạo, sửa hay dùng lại ref giữa các case.
 
 ## 5. Failure policy
