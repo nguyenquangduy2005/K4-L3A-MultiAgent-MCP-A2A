@@ -281,3 +281,13 @@ def test_unconfirmed_claim_widens_evidence_before_concluding(tmp_path: Path) -> 
     assert output["assessment"]["primary_issue"] == "unsupported_claim"
     assert "get_shipment_summary" in gateway.calls and "get_refund_timeline" in gateway.calls
     assert '"decision_code":"widen_evidence"' in "\n".join(events)
+
+
+def test_fatal_errors_are_found_inside_exception_groups() -> None:
+    from student_agent.cli import _fatal_leaf
+
+    wrapped = ExceptionGroup(
+        "tg", [ExceptionGroup("inner", [RuntimeError("MCP preflight failed")])]
+    )
+    assert isinstance(_fatal_leaf(wrapped), RuntimeError)
+    assert _fatal_leaf(ExceptionGroup("tg", [ConnectionError("dropped")])) is None

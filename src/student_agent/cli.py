@@ -7,15 +7,16 @@ import shutil
 import sys
 from pathlib import Path
 
-from .cases import load_case_set
+from .cases import CaseSet, load_case_set
 from .config import Settings
 from .contracts import Contracts
-from .mcp_gateway import connect_gateway
+from .mcp_gateway import EvidenceGateway, connect_gateway
 from .submission import package_submission, recite_outputs, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
 
 MAX_RECONNECTS = 10
+MAX_CONSECUTIVE_FALLBACKS = 5  # stop early instead of burning MCP calls on a broken server
 MAX_FALLBACK_RATIO = 0.1  # more fallbacks than this means MCP is unhealthy, not the cases
 
 
@@ -29,6 +30,28 @@ async def _show_tools(root: Path) -> None:
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         for tool in await gateway.list_tools():
             print(tool)
+
+
+def _fatal_leaf(exc: BaseException) -> BaseException | None:
+    """anyio wraps errors from the MCP task group in ExceptionGroups; unwrap to find them."""
+    if isinstance(exc, BaseExceptionGroup):
+        for inner in exc.exceptions:
+            found = _fatal_leaf(inner)
+            if found is not None:
+                return found
+        return None
+    return exc if isinstance(exc, ValueError | RuntimeError) else None
+
+
+async def _preflight(gateway: EvidenceGateway, case_set: CaseSet) -> None:
+    """One cheap call so a broken gateway is detected before the whole run starts."""
+    case = case_set.cases[case_set.case_ids[0]]
+    try:
+        await gateway.call(
+            "get_policy", case_id=case["case_id"], policy_version=case["policy_version"]
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"MCP preflight failed, not starting the run: {exc}") from exc
 
 
 async def _run(root: Path, force: bool = False) -> None:
@@ -45,6 +68,7 @@ async def _run(root: Path, force: bool = False) -> None:
 
     pending = list(case_set.case_ids)
     reconnects = 0
+    fallback_streak = 0
     while pending:
         try:
             async with connect_gateway(
@@ -52,12 +76,23 @@ async def _run(root: Path, force: bool = False) -> None:
             ) as gateway:
                 if not await gateway.list_tools():
                     raise RuntimeError("MCP Gateway returned no tools")
+                await _preflight(gateway, case_set)
                 while pending:
                     case_id = pending[0]
                     case = case_set.cases[case_id]
                     trace.discard_case(case_id)
                     trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
                     output = await solve_case(case, gateway, trace)
+                    if output["assessment"]["primary_issue"] == "insufficient_evidence":
+                        fallback_streak += 1
+                    else:
+                        fallback_streak = 0
+                    if fallback_streak >= MAX_CONSECUTIVE_FALLBACKS and not gateway.broken:
+                        raise RuntimeError(
+                            f"{fallback_streak} consecutive cases fell back to "
+                            "insufficient_evidence: MCP looks unhealthy, stopping early. "
+                            f"Existing outputs/traces were kept; inspect {staging}."
+                        )
                     if gateway.broken:  # transport died mid-case: redo it on a fresh session
                         raise ConnectionError(f"MCP session lost during {case_id}")
                     contracts.validate_output(output, f"outputs/{case_id}.json")
@@ -74,8 +109,9 @@ async def _run(root: Path, force: bool = False) -> None:
         except Exception as exc:
             if not pending:
                 break  # everything finished; only the connection teardown failed
-            if isinstance(exc, ValueError | RuntimeError):
-                raise
+            leaf = _fatal_leaf(exc)
+            if leaf is not None:  # a real failure, not a dropped connection: never retry it
+                raise leaf from exc
             reconnects += 1
             if reconnects > MAX_RECONNECTS:
                 raise RuntimeError(f"MCP connection kept failing: {exc}") from exc
