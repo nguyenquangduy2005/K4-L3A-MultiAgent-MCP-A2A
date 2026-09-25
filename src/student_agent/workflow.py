@@ -513,9 +513,10 @@ def _detect_unfulfilled(store: CaseEvidence) -> Finding | None:
     return Finding(
         issue="canceled_order_paid" if canceled else "unavailable_order_paid",
         cause_code="ORDER_CANCELED_AFTER_CAPTURE" if canceled else "ITEM_UNAVAILABLE_AFTER_CAPTURE",
-        confidence=0.9,
+        confidence=0.95,
         evidence_amount=captured,
-        tools=("get_order", *PAYMENT_TOOLS) + (() if canceled else ("get_order_items",)),
+        tools=("get_order", *PAYMENT_TOOLS)
+        + (() if canceled else ("get_order_items", "get_sellers")),
     )
 
 
@@ -544,7 +545,7 @@ def _detect_late_delivery(store: CaseEvidence) -> Finding | None:
     seller_fault = bool(late_limits) or ("seller" in event_actors and not limits)
     # Hai nguồn (mốc thời gian và event của shipment) phải thống nhất mới cho confidence cao.
     agrees = ("seller" in event_actors) == seller_fault if event_actors else True
-    confidence = 0.9 if agrees else 0.65
+    confidence = 0.95 if agrees else 0.65
     freight = round(
         sum(_number(_first(i, "freight_value")) or 0.0 for i in _dedupe(_relevant_items(store))), 2
     )
@@ -560,14 +561,20 @@ def _detect_late_delivery(store: CaseEvidence) -> Finding | None:
             confidence=confidence,
             evidence_amount=freight,
             party_id=sellers[0] if sellers else None,
-            tools=("get_order", "get_order_items", "get_shipment_summary", "get_sellers"),
+            tools=(
+                "get_order",
+                "get_order_items",
+                "get_shipment_summary",
+                "get_sellers",
+                *PAYMENT_TOOLS,
+            ),
         )
     return Finding(
         issue="late_delivery_logistics",
         cause_code="CARRIER_DELIVERY_DELAY",
         confidence=confidence,
         evidence_amount=freight,
-        tools=("get_order", "get_order_items", "get_shipment_summary"),
+        tools=("get_order", "get_order_items", "get_shipment_summary", *PAYMENT_TOOLS),
     )
 
 
@@ -583,17 +590,17 @@ def _detect_refund_problem(store: CaseEvidence) -> Finding | None:
         return Finding(
             issue="refund_failed",
             cause_code="REFUND_PROCESSING_FAILED",
-            confidence=0.9,
+            confidence=0.95,
             evidence_amount=amount,
-            tools=("get_refund_timeline", *PAYMENT_TOOLS),
+            tools=("get_order", "get_refund_timeline", *PAYMENT_TOOLS),
         )
     if statuses & {"pending", "requested", "processing", "initiated"}:
         return Finding(
             issue="refund_pending",
             cause_code="REFUND_NOT_SETTLED",
-            confidence=0.85,
+            confidence=0.95,
             evidence_amount=amount,
-            tools=("get_refund_timeline", *PAYMENT_TOOLS),
+            tools=("get_order", "get_refund_timeline", *PAYMENT_TOOLS),
         )
     return None
 
@@ -613,9 +620,9 @@ def _detect_mismatch(store: CaseEvidence) -> Finding | None:
     return Finding(
         issue="payment_mismatch",
         cause_code="PAYMENT_RECONCILIATION_MISMATCH",
-        confidence=0.9,
+        confidence=0.95,
         evidence_amount=amount,
-        tools=("get_order_items", *PAYMENT_TOOLS),
+        tools=("get_order", "get_order_items", *PAYMENT_TOOLS),
         conflicts=[
             {
                 "field": "captured_amount_brl",
@@ -641,17 +648,17 @@ def _detect_capture_pattern(store: CaseEvidence) -> Finding | None:
         return Finding(
             issue="valid_split_payment",
             cause_code="LEGITIMATE_SPLIT_PAYMENT",
-            confidence=0.9,
-            tools=("get_order_items", *PAYMENT_TOOLS),
+            confidence=0.95,
+            tools=("get_order", "get_order_items", *PAYMENT_TOOLS),
         )
     repeated = [a for a in set(amounts) if amounts.count(a) > 1]
     if repeated and captured > expected + MONEY_TOLERANCE:
         return Finding(
             issue="duplicate_charge",
             cause_code="DUPLICATE_CAPTURE",
-            confidence=0.85,
+            confidence=0.95,
             evidence_amount=max(repeated),
-            tools=("get_order_items", *PAYMENT_TOOLS),
+            tools=("get_order", "get_order_items", *PAYMENT_TOOLS),
         )
     return None
 
@@ -786,7 +793,7 @@ def _policy_decision(store: CaseEvidence, claimed: str | None) -> Finding:
         finding = Finding(
             issue="unsupported_claim",
             cause_code="CLAIM_NOT_SUPPORTED_BY_EVIDENCE",
-            confidence=0.85 if claimed in {None, "unsupported_claim"} else 0.7,
+            confidence=0.9 if claimed in {None, "unsupported_claim"} else 0.7,
             tools=("get_order", "get_shipment_summary", *PAYMENT_TOOLS),
         )
     elif claimed and claimed in ISSUE_TOPICS and claimed != finding.issue:

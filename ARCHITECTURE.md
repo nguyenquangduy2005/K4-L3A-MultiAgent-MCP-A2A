@@ -70,7 +70,7 @@ Không dùng `get_customer_history` và `get_product_context`: mọi case đều
 1. Specialist gọi `gateway.call(tool, case_id=..., order_id=...)`.
 2. Gateway đọc `structuredContent` (hoặc một text block JSON) và chạy `contracts.validate_evidence`.
 3. Ngay sau call, specialist emit `tool_result_consumed` với `tool_name`, đúng ref vừa nhận và `domain`.
-4. Policy agent chọn các tool **thật sự hỗ trợ** kết luận (vd duplicate charge → payments + payment timeline; late delivery seller → order, items, shipment, sellers, policy). Chỉ ref của các tool đó được cite trong `evidence_refs` và `claim_assessments`; nếu các tool đó không có ref thì dùng domain liên quan (`ISSUE_DOMAINS`).
+4. Policy agent chọn các tool **thật sự hỗ trợ** kết luận. `order` luôn được cite vì là thực thể gốc; cộng thêm nhóm theo issue: payment (payments + payment timeline) cho các issue về tiền và cho trễ giao (số tiền hoàn lấy từ capture), shipment + item cho trễ giao, seller khi seller chịu trách nhiệm, refund cho refund pending/failed, và policy khi policy quyết định action/số tiền. Chỉ ref của các tool đó được cite trong `evidence_refs` và `claim_assessments`; nếu các tool đó không có ref thì dùng domain liên quan (`ISSUE_DOMAINS`).
 5. Hệ thống không tự tạo, sửa hay dùng lại ref giữa các case.
 
 ## 5. Failure policy
