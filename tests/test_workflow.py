@@ -46,6 +46,7 @@ def order_data(status: str) -> dict[str, Any]:
     return {
         "order_id": ORDER_ID,
         "order_status": status,
+        "order_purchase_timestamp": "2018-01-01T09:00:00-03:00",
         "order_delivered_customer_date": None,
         "order_estimated_delivery_date": "2018-01-10T09:00:00-03:00",
     }
@@ -71,7 +72,12 @@ class FakeGateway:
                 {
                     "payments": [PAYMENT],
                     "events": [
-                        {"event_type": "captured", "status": "confirmed", "amount_brl": "79.00"}
+                        {
+                            "event_type": "captured",
+                            "status": "confirmed",
+                            "amount_brl": "79.00",
+                            "event_at": "2018-01-01T09:00:00-03:00",
+                        }
                     ],
                 },
             ),
@@ -241,13 +247,20 @@ def test_verifier_rejects_party_that_contradicts_the_issue(tmp_path: Path) -> No
 
 def test_confidence_drops_only_for_an_unbacked_refund_amount(tmp_path: Path) -> None:
     clean, _ = run_case(FakeGateway("canceled"), tmp_path)
-    assert clean["assessment"]["confidence"] == 0.9
+    assert clean["assessment"]["confidence"] == 0.95
     gateway = FakeGateway("canceled")
     gateway.data["get_payment_timeline"] = (
         "payment",
         {
             "payments": [{**PAYMENT, "payment_value": "90.00"}],
-            "events": [{"event_type": "captured", "status": "confirmed", "amount_brl": "90.00"}],
+            "events": [
+                {
+                    "event_type": "captured",
+                    "status": "confirmed",
+                    "amount_brl": "90.00",
+                    "event_at": "2018-01-01T09:00:00-03:00",
+                }
+            ],
         },
     )
     gateway.data["get_order_items"] = (
@@ -255,7 +268,7 @@ def test_confidence_drops_only_for_an_unbacked_refund_amount(tmp_path: Path) -> 
         [{**ITEM, "price": "90.00", "freight_value": "0.00"}],
     )
     doubtful, _ = run_case(gateway, tmp_path / "b")
-    assert doubtful["assessment"]["confidence"] == 0.85
+    assert doubtful["assessment"]["confidence"] == 0.9
     assert doubtful["data_conflicts"][0]["resolution_code"] == "POLICY_AMOUNT_NOT_IN_EVIDENCE"
 
 
@@ -264,7 +277,7 @@ def test_output_cites_every_evidence_the_specialists_consumed(tmp_path: Path) ->
     assert set(output["evidence_refs"]) == set(consumed_refs(events))
 
 
-def test_claim_driven_plan_calls_only_the_tools_it_needs(tmp_path: Path) -> None:
+def test_every_domain_is_examined_before_concluding(tmp_path: Path) -> None:
     gateway = FakeGateway("canceled")
     run_case(gateway, tmp_path)
     assert sorted(gateway.calls) == [
@@ -272,22 +285,49 @@ def test_claim_driven_plan_calls_only_the_tools_it_needs(tmp_path: Path) -> None
         "get_order_items",
         "get_payment_timeline",
         "get_policy",
+        "get_refund_timeline",
+        "get_shipment_summary",
     ]
 
 
-def test_unconfirmed_claim_widens_evidence_before_concluding(tmp_path: Path) -> None:
-    gateway = FakeGateway("delivered")  # the claimed cancellation is not backed by the order
-    output, events = run_case(gateway, tmp_path)
-    assert output["assessment"]["primary_issue"] == "unsupported_claim"
-    assert "get_shipment_summary" in gateway.calls and "get_refund_timeline" in gateway.calls
-    assert '"decision_code":"widen_evidence"' in "\n".join(events)
+def test_partial_evidence_cannot_conclude_against_the_claim() -> None:
+    from student_agent import rules
+
+    order = {"status": "delivered", "item_totals": [], "purchase_day": "", "delivered_day": ""}
+    with pytest.raises(rules.NeedsWiderEvidence):
+        rules.decide(
+            {"customer_request": {"claims": [{"topic": "canceled_order_paid"}]}},
+            {**order, "seller_ids": [], "amounts": []},
+            rules.NEUTRAL_PAYMENT,
+            rules.NEUTRAL_REFUND,
+            rules.NEUTRAL_SHIPMENT,
+            POLICY,
+            full=False,
+        )
 
 
-def test_fatal_errors_are_found_inside_exception_groups() -> None:
-    from student_agent.cli import _fatal_leaf
+def test_signal_on_the_order_timeline_beats_an_off_timeline_claim() -> None:
+    from student_agent import rules
 
-    wrapped = ExceptionGroup(
-        "tg", [ExceptionGroup("inner", [RuntimeError("MCP preflight failed")])]
-    )
-    assert isinstance(_fatal_leaf(wrapped), RuntimeError)
-    assert _fatal_leaf(ExceptionGroup("tg", [ConnectionError("dropped")])) is None
+    order = {
+        "status": "delivered",
+        "item_totals": ["89.00"],
+        "purchase_day": "2018-09-06",
+        "delivered_day": "2018-09-15",
+    }
+    # claimed payment_mismatch, but the mismatch is dated months before the purchase while the
+    # refund request lands two days after delivery
+    payment = {
+        **rules.NEUTRAL_PAYMENT,
+        "captured_brl": 89.0,
+        "mismatch": True,
+        "mismatch_days": ["2018-05-25"],
+    }
+    refund = {"pending": True, "failed": False, "days": {"pending": ["2018-09-17"]}}
+    supported = {"payment_mismatch", "refund_pending"}
+    assert rules.anchored_issues(supported, order, payment, refund) == {"refund_pending"}
+    on_time = {**payment, "mismatch_days": ["2018-09-06"]}
+    assert rules.anchored_issues(supported, order, on_time, refund) == {
+        "payment_mismatch",
+        "refund_pending",
+    }

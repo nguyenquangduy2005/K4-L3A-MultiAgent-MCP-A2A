@@ -65,20 +65,8 @@ EVIDENCE_ORDER = (
     "shipment",
     "policy",
 )
-# Which evidence each claimed issue needs. The coordinator plans from the customer's claim and
-# widens to FULL_PLAN if the claim is not confirmed, so every conclusion stays evidence-backed
-# while the call count stays low.
-CLAIM_PLAN = {
-    "canceled_order_paid": ("order", "items", "timeline"),
-    "unavailable_order_paid": ("order", "items", "timeline"),
-    "late_delivery_seller": ("order", "items", "shipment"),
-    "late_delivery_logistics": ("order", "items", "shipment"),
-    "valid_split_payment": ("order", "items", "timeline"),
-    "payment_mismatch": ("order", "items", "timeline"),
-    "duplicate_charge": ("order", "items", "timeline"),
-    "refund_pending": ("order", "items", "timeline", "refunds"),
-    "refund_failed": ("order", "items", "timeline", "refunds"),
-}
+# The customer's claim is not ground truth, so every domain an issue depends on is examined and
+# the answer is chosen from evidence (see `anchored_issues`). A replan widens to FULL_PLAN.
 EXAMINE_ALL = ("order", "items", "timeline", "refunds", "shipment")
 FULL_PLAN = ("order", "items", "sellers", "payments", "timeline", "refunds", "shipment")
 NEUTRAL_PAYMENT = {
@@ -86,10 +74,14 @@ NEUTRAL_PAYMENT = {
     "duplicate": False,
     "mismatch": False,
     "split_sums": [],
+    "capture_days": {},
+    "duplicate_values": [],
+    "mismatch_days": [],
+    "split_pairs": [],
     "amounts": [],
     "payment_refs": [],
 }
-NEUTRAL_REFUND = {"pending": False, "failed": False}
+NEUTRAL_REFUND = {"pending": False, "failed": False, "days": {}}
 NEUTRAL_SHIPMENT = {"late_actor": None, "event_contradicted": False, "shipment_id": None}
 
 
@@ -97,11 +89,8 @@ class NeedsWiderEvidence(Exception):
     """The claimed issue is not confirmed by the evidence fetched so far."""
 
 
-def plan_for(case: dict[str, Any], widen: bool = False) -> tuple[str, ...]:
-    if widen:
-        return FULL_PLAN
-    claimed = claimed_issue(case)
-    return CLAIM_PLAN.get(claimed, EXAMINE_ALL) if claimed else EXAMINE_ALL
+def plan_for(_case: dict[str, Any], widen: bool = False) -> tuple[str, ...]:
+    return FULL_PLAN if widen else EXAMINE_ALL
 
 
 PAYMENT_ISSUES = {
@@ -113,6 +102,8 @@ PAYMENT_ISSUES = {
     "refund_pending",
     "refund_failed",
 }
+PAYMENT_TIMED = {"duplicate_charge", "payment_mismatch", "valid_split_payment"}
+REFUND_TIMED = {"refund_pending", "refund_failed"}
 LATE_ISSUES = {"late_delivery_seller", "late_delivery_logistics"}
 # Calibration: bases per decision path; never reach 1.0; each unresolved conflict costs a little.
 CONFIDENCE_CAP = 0.95
@@ -146,6 +137,8 @@ def order_signals(order: dict[str, Any], items: list[dict[str, Any]]) -> dict[st
         "item_ids": sorted({row["order_item_id"] for row in items}),
         "seller_ids": sorted({row["seller_id"] for row in items}),
         "item_totals": totals,
+        "purchase_day": (order.get("order_purchase_timestamp") or "")[:10],
+        "delivered_day": (order.get("order_delivered_customer_date") or "")[:10],
         "amounts": sorted(
             {str(_money(row[key])) for row in items for key in ("price", "freight_value")}
             | set(totals)
@@ -169,6 +162,10 @@ def payment_signals(order_id: str, timeline: dict[str, Any]) -> dict[str, Any]:
     rows = Counter(
         (p["payment_sequential"], p["payment_type"], p["payment_value"]) for p in payments
     )
+    capture_days: dict[str, list[str]] = {}
+    for e in events:
+        if e["event_type"] == "captured" and e["status"] == "confirmed":
+            capture_days.setdefault(str(_money(e["amount_brl"])), []).append(e["event_at"][:10])
     mismatches = [
         e for e in events if e["event_type"] == "reconciliation_mismatch" and e["status"] == "open"
     ]
@@ -183,6 +180,17 @@ def payment_signals(order_id: str, timeline: dict[str, Any]) -> dict[str, Any]:
         }
     )
     return {
+        "capture_days": capture_days,
+        "duplicate_values": sorted({str(_money(k[2])) for k, count in rows.items() if count >= 2}),
+        "mismatch_days": sorted({e["event_at"][:10] for e in mismatches}),
+        "split_pairs": sorted(
+            {
+                (str(_money(a["payment_value"])), str(_money(b["payment_value"])))
+                for a in first
+                for b in second
+                if a["payment_type"] != b["payment_type"]
+            }
+        ),
         "captured_brl": _amount(captured),
         "duplicate": any(count >= 2 for count in rows.values()),
         "mismatch": bool(mismatches),
@@ -196,8 +204,16 @@ def payment_signals(order_id: str, timeline: dict[str, Any]) -> dict[str, Any]:
 
 
 def refund_signals(refunds: dict[str, Any] | None) -> dict[str, Any]:
-    statuses = {e["status"] for e in (refunds or {}).get("events", [])}
-    return {"pending": "pending" in statuses, "failed": "failed" in statuses}
+    events = (refunds or {}).get("events", [])
+    statuses = {e["status"] for e in events}
+    return {
+        "pending": "pending" in statuses,
+        "failed": "failed" in statuses,
+        "days": {
+            status: sorted({e["event_at"][:10] for e in events if e["status"] == status})
+            for status in statuses
+        },
+    }
 
 
 def shipment_signals(shipment: dict[str, Any]) -> dict[str, Any]:
@@ -248,6 +264,50 @@ def supported_issues(
     return found
 
 
+def _gap_days(later: str, earlier: str) -> int | None:
+    try:
+        return (datetime.fromisoformat(later) - datetime.fromisoformat(earlier)).days
+    except ValueError:
+        return None
+
+
+REFUND_WINDOW_DAYS = 7
+
+
+def anchored_issues(
+    supported: set[str],
+    order: dict[str, Any],
+    payment: dict[str, Any],
+    refund: dict[str, Any],
+) -> set[str]:
+    """Supported issues whose signal sits on this order's own timeline.
+
+    Genuine signals are dated on the purchase day (payments) or right after delivery (refunds);
+    noise injected from other orders carries unrelated dates.
+    """
+    buy = order["purchase_day"]
+    anchored = {i for i in supported if i not in PAYMENT_TIMED | REFUND_TIMED}
+    days = payment["capture_days"]
+    if "duplicate_charge" in supported and any(
+        buy in days.get(value, []) for value in payment["duplicate_values"]
+    ):
+        anchored.add("duplicate_charge")
+    if "payment_mismatch" in supported and buy in payment["mismatch_days"]:
+        anchored.add("payment_mismatch")
+    if "valid_split_payment" in supported and any(
+        buy in days.get(a, []) and buy in days.get(b, []) for a, b in payment["split_pairs"]
+    ):
+        anchored.add("valid_split_payment")
+    reference = order["delivered_day"] or buy
+    for issue, status in (("refund_pending", "pending"), ("refund_failed", "failed")):
+        if issue in supported and any(
+            (gap := _gap_days(day, reference)) is not None and 0 <= gap <= REFUND_WINDOW_DAYS
+            for day in refund["days"].get(status, [])
+        ):
+            anchored.add(issue)
+    return anchored
+
+
 def claimed_issue(case: dict[str, Any]) -> str | None:
     for claim in case.get("customer_request", {}).get("claims", []):
         if claim.get("topic") in ISSUES:
@@ -275,10 +335,15 @@ def decide(
     claimed = claimed_issue(case)
     if not full and claimed not in supported and claimed != "unsupported_claim":
         raise NeedsWiderEvidence(claimed or "no claim")
-    if claimed in supported:
+    anchored = anchored_issues(supported, order, payment, refund)
+    if claimed in supported and (claimed in anchored or not anchored):
         issue = claimed
         # only the claimed domain was examined unless full evidence was fetched
         confidence = 0.85 if len(supported) > 1 else (0.95 if full else 0.9)
+    elif anchored and claimed in supported:
+        # the claim's signal is off this order's timeline while another issue's is on it
+        issue = next(name for name in PRECEDENCE if name in anchored)
+        confidence = 0.75
     elif claimed == "unsupported_claim" and not supported:
         issue, confidence = "unsupported_claim", 0.9
     elif supported:
