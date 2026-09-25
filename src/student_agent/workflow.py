@@ -516,8 +516,8 @@ def _detect_unfulfilled(store: CaseEvidence) -> Finding | None:
         cause_code="ORDER_CANCELED_AFTER_CAPTURE" if canceled else "ITEM_UNAVAILABLE_AFTER_CAPTURE",
         confidence=0.95,
         evidence_amount=captured,
-        tools=("get_order", *PAYMENT_TOOLS)
-        + ("get_order_items",)
+        # Shipment cho thấy đơn đã được giao carrier hay chưa khi bị hủy/hết hàng.
+        tools=("get_order", *PAYMENT_TOOLS, "get_order_items", "get_shipment_summary")
         + (() if canceled else ("get_sellers",)),
     )
 
