@@ -78,27 +78,37 @@ Không dùng `get_customer_history` và `get_product_context`: mọi case đều
 | Failure | Retry? | Fallback | Trace |
 | --- | --- | --- | --- |
 | `get_order` lỗi / timeout | Có, tối đa 3 lần/case, chờ 2s × lần thử | Sau 3 lần: bỏ case, in `[FAILED]`, chạy tiếp | Event của lần thử lỗi bị bỏ (buffer) |
-| Tool phụ lỗi (not found…) | Không | Bỏ qua tool đó, detector làm việc với evidence còn lại | Không có `tool_result_consumed` cho tool đó |
+| Tool phụ lỗi (vd `get_refund_timeline` khi đơn không có refund) | Không | Bỏ qua tool đó, detector làm việc với evidence còn lại | Không có `tool_result_consumed` cho tool đó |
 | Evidence sai contract | Có (exception → retry case) | Như dòng 1 | Như dòng 1 |
 | Không detector nào khớp | Không | `unsupported_claim`, `no_action`, confidence 0.75 | `policy_decided` |
 | Không có `get_order` | Không | `insufficient_evidence`, confidence 0.30 | `policy_decided` |
-| Source conflict (tổng payment ≠ tổng item) | Không | Chọn tổng item làm chuẩn, ghi `data_conflicts` | `policy_decided` |
+| Source conflict (dòng nhiễu, số tiền evidence ≠ policy) | Không | Lọc theo cửa sổ thời gian; số tiền theo policy; mismatch ghi `data_conflicts` | `policy_decided` |
 
 Mọi MCP call là thao tác đọc nên retry idempotent. `day09 run` bỏ qua case đã có output hợp lệ; sau khi sửa logic phải xóa `outputs/*.json` và `traces/trace.jsonl` rồi chạy lại toàn bộ.
 
 ## 6. Policy và verification invariants
 
-Detector (trong `workflow.py`), ưu tiên kiểm chứng claim của khách trước rồi quét các issue còn lại:
+**Lọc nhiễu.** Evidence của gateway trộn các dòng thuộc đơn với các dòng mang mốc thời gian không liên quan (capture tháng 5 cho đơn tháng 12, `shipping_limit` hoặc refund lệch hàng tuần). Agent chỉ dùng:
 
-| Issue | Điều kiện trên evidence | Refund |
-| --- | --- | --- |
-| canceled/unavailable_order_paid | `order_status` = canceled/unavailable và số đã capture − refund hoàn tất > 0 | phần còn lại |
-| late_delivery_seller | giao khách > ngày dự kiến và giao carrier > `shipping_limit_date` | phí vận chuyển (theo policy) |
-| late_delivery_logistics | giao khách > ngày dự kiến, seller giao carrier đúng hạn | phí vận chuyển (theo policy) |
-| duplicate_charge | ≥ 2 capture cùng payment reference và cùng số tiền | số tiền trùng |
-| refund_failed / refund_pending | refund event có status failed / pending, chưa có refund hoàn tất | số tiền refund lỗi / 0 |
-| payment_mismatch | tổng capture ≠ tổng (price + freight) | phần thu thừa |
-| valid_split_payment | nhiều payment, tổng khớp tổng đơn | 0 |
+- payment event (capture, `reconciliation_mismatch`) trong ±1 ngày quanh `order_approved_at`, bỏ dòng trùng y hệt;
+- item, shipping limit, refund và shipment event trong cửa sổ [ngày mua − 1 ngày, max(ngày giao, ngày dự kiến) + 3 ngày].
+
+**Detector** (chạy theo thứ tự, claim của khách không quyết định kết quả):
+
+| Issue | Điều kiện trên evidence đã lọc |
+| --- | --- |
+| canceled / unavailable_order_paid | `order_status` = canceled / unavailable và có capture |
+| late_delivery_seller | giao khách > ngày dự kiến và giao carrier > `shipping_limit` của item; đối chiếu `actor` của event `delivered_late` |
+| late_delivery_logistics | giao khách > ngày dự kiến, seller giao carrier đúng hạn |
+| refund_failed / refund_pending | refund event trong cửa sổ có status failed / pending |
+| payment_mismatch | có `reconciliation_mismatch` đang mở |
+| valid_split_payment | ≥ 2 capture có tổng = tổng (price + freight) của item |
+| duplicate_charge | ≥ 2 capture cùng số tiền, tổng vượt tổng đơn |
+| unsupported_claim | không detector nào khớp |
+
+**Policy.** `get_policy(EC_POLICY_V1)` quy định cho từng issue: `case_status`, `recommended_action` (dùng làm `resolution_actions` và `reason_code`), `responsible_parties` và `refund_brl`. Số tiền tính từ evidence được đối chiếu với policy; nếu lệch thì dùng policy và hạ confidence. `party_id` của seller lấy từ evidence.
+
+**Claim `requested_full_refund`:** `supported` khi issue hoàn toàn bộ (hủy đơn, hết hàng, refund lỗi); `partially_supported` khi chỉ hoàn một phần hoặc refund đang xử lý; `unsupported` khi không hoàn.
 
 Verifier kiểm tra trước khi ghi output:
 

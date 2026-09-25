@@ -8,9 +8,8 @@ verifier kiểm tra các invariant trước khi coordinator dựng output.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .mcp_gateway import EvidenceGateway
@@ -45,6 +44,9 @@ ISSUE_DOMAINS: dict[str, tuple[str, ...]] = {
 }
 
 MONEY_TOLERANCE = 0.01
+
+# Issue mà hướng xử lý là hoàn toàn bộ số đã thu.
+FULL_REFUND_ISSUES = {"canceled_order_paid", "unavailable_order_paid", "refund_failed"}
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +365,120 @@ async def _policy_lookup(
 
 
 # ---------------------------------------------------------------------------
+# Lọc nhiễu: chỉ dùng các dòng nằm trong cửa sổ thời gian của đơn hàng
+# ---------------------------------------------------------------------------
+
+WINDOW_BEFORE = timedelta(days=1)
+WINDOW_AFTER = timedelta(days=3)
+
+
+def _order_window(store: CaseEvidence) -> tuple[datetime, datetime] | None:
+    """[ngày mua − 1 ngày, max(ngày giao, ngày dự kiến) + 3 ngày].
+
+    Evidence của gateway trộn dòng thuộc đơn này với dòng mang mốc thời gian không
+    liên quan (capture/refund/hạn giao hàng lệch hàng tuần). Dòng ngoài cửa sổ bị bỏ.
+    """
+    order = store.order() or {}
+    start = _time(_first(order, "order_purchase_timestamp", "order_approved_at"))
+    ends = [
+        _time(_first(order, "order_estimated_delivery_date")),
+        _time(_first(order, "order_delivered_customer_date")),
+    ]
+    ends = [t for t in ends if t]
+    if not start or not ends:
+        return None
+    return start - WINDOW_BEFORE, max(ends) + WINDOW_AFTER
+
+
+def _in_window(store: CaseEvidence, value: Any) -> bool:
+    window = _order_window(store)
+    moment = _time(value)
+    if window is None or moment is None:
+        return True
+    return window[0] <= moment <= window[1]
+
+
+def _event_time(event: dict[str, Any]) -> Any:
+    return _first(event, "event_at", "occurred_at", "created_at", "timestamp")
+
+
+def _dedupe(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bỏ dòng trùng y hệt (cùng thời điểm, cùng số tiền): bản ghi lặp, không phải giao dịch."""
+    unique: list[dict[str, Any]] = []
+    for record in records:
+        if record not in unique:
+            unique.append(record)
+    return unique
+
+
+def _relevant_payment_events(store: CaseEvidence) -> list[dict[str, Any]]:
+    """Capture/đối soát diễn ra quanh lúc duyệt đơn; dùng cửa sổ hẹp ±1 ngày khi có mốc này."""
+    approved = _time(_first(store.order(), "order_approved_at", "order_purchase_timestamp"))
+    events = store.payment_events()
+    if approved is None:
+        return [e for e in events if _in_window(store, _event_time(e))]
+    return [
+        e
+        for e in events
+        if (moment := _time(_event_time(e))) is None or abs(moment - approved) <= timedelta(days=1)
+    ]
+
+
+def _relevant_captures(store: CaseEvidence) -> list[dict[str, Any]]:
+    return _dedupe(
+        [
+            e
+            for e in _relevant_payment_events(store)
+            if "captur" in _event_kind(e) and _event_amount(e) is not None
+        ]
+    )
+
+
+def _relevant_refunds(store: CaseEvidence) -> list[dict[str, Any]]:
+    return [e for e in store.refund_events() if _in_window(store, _event_time(e))]
+
+
+def _relevant_items(store: CaseEvidence) -> list[dict[str, Any]]:
+    items = store.items()
+    relevant = [i for i in items if _in_window(store, _first(i, "shipping_limit_date"))]
+    return relevant or items
+
+
+def _relevant_shipping_limits(store: CaseEvidence) -> list[dict[str, Any]]:
+    limits = _records(store.shipment(), {"shipping_limit_at", "shipping_limit_date"})
+    relevant = [
+        s
+        for s in limits
+        if _in_window(store, _first(s, "shipping_limit_at", "shipping_limit_date"))
+    ]
+    if relevant:
+        return relevant
+    return [
+        {"seller_id": _first(i, "seller_id"), "shipping_limit_at": _first(i, "shipping_limit_date")}
+        for i in _relevant_items(store)
+    ]
+
+
+def _relevant_shipment_events(store: CaseEvidence) -> list[dict[str, Any]]:
+    events = _records(store.shipment().get("events"), {"event_type"})
+    return [e for e in events if _in_window(store, _event_time(e))]
+
+
+def _sum(records: list[dict[str, Any]]) -> float:
+    return round(sum(_event_amount(r) or 0.0 for r in records), 2)
+
+
+def _item_total(items: list[dict[str, Any]]) -> float:
+    return round(
+        sum(
+            (_number(_first(i, "price")) or 0.0) + (_number(_first(i, "freight_value")) or 0.0)
+            for i in _dedupe(items)
+        ),
+        2,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Detectors: mỗi hàm trả về Finding nếu evidence xác nhận issue
 # ---------------------------------------------------------------------------
 
@@ -370,341 +486,313 @@ async def _policy_lookup(
 @dataclass
 class Finding:
     issue: str
-    case_status: str
-    party_type: str
     cause_code: str
     confidence: float
-    refund: float = 0.0
-    refund_reason: str = ""
-    refund_entity: str | None = None
+    evidence_amount: float = 0.0
     party_id: str | None = None
     tools: tuple[str, ...] = ()
-    actions: tuple[str, ...] = ()
     conflicts: list[dict[str, Any]] = field(default_factory=list)
+    # Điền từ policy (hoặc mặc định) trong _apply_policy.
+    case_status: str = "needs_investigation"
+    party_type: str = "unknown"
+    refund: float = 0.0
+    actions: tuple[str, ...] = ()
 
 
-def _captured_total(store: CaseEvidence) -> float | None:
-    captures = [
-        amount
-        for e in store.payment_events()
-        if any(word in _event_kind(e) for word in ("capture", "charge", "paid", "settle"))
-        and (amount := _event_amount(e)) is not None
-    ]
-    if captures:
-        return round(sum(captures), 2)
-    return store.payment_total()
+PAYMENT_TOOLS = ("get_order_payments", "get_payment_timeline")
 
 
-def _refunded_total(store: CaseEvidence, statuses: tuple[str, ...]) -> float:
-    total = 0.0
-    for event in store.refund_events() + store.payment_events():
-        kind = _event_kind(event)
-        if "refund" in kind or event in store.refund_events():
-            status = _lower(_first(event, "status", "refund_status", "event_type", "event"))
-            if any(s in status or s in kind for s in statuses):
-                total += _event_amount(event) or 0.0
-    return round(total, 2)
-
-
-def _detect_paid_but_not_fulfilled(store: CaseEvidence, status: str, issue: str) -> Finding | None:
-    if store.order_status() != status:
+def _detect_unfulfilled(store: CaseEvidence) -> Finding | None:
+    status = store.order_status()
+    if status not in {"canceled", "unavailable"}:
         return None
-    paid = _captured_total(store) or 0.0
-    refunded = _refunded_total(store, ("completed", "succeeded", "success", "refunded", "done"))
-    outstanding = _money(paid - refunded)
-    if outstanding <= MONEY_TOLERANCE:
+    captured = _sum(_relevant_captures(store))
+    if captured <= MONEY_TOLERANCE:
         return None
+    canceled = status == "canceled"
     return Finding(
-        issue=issue,
-        case_status="action_required",
-        party_type="seller" if issue == "unavailable_order_paid" else "platform",
-        cause_code="ORDER_CANCELED_AFTER_PAYMENT"
-        if issue == "canceled_order_paid"
-        else "ORDER_UNAVAILABLE_AFTER_PAYMENT",
+        issue="canceled_order_paid" if canceled else "unavailable_order_paid",
+        cause_code="ORDER_CANCELED_AFTER_CAPTURE" if canceled else "ITEM_UNAVAILABLE_AFTER_CAPTURE",
         confidence=0.9,
-        refund=outstanding,
-        refund_reason="FULL_REFUND_UNFULFILLED_ORDER",
-        refund_entity=store.order_id,
-        tools=("get_order", "get_order_payments", "get_payment_timeline", "get_refund_timeline"),
-        actions=("issue_full_refund",),
+        evidence_amount=captured,
+        tools=("get_order", *PAYMENT_TOOLS) + (() if canceled else ("get_order_items",)),
     )
-
-
-def _delivery_times(store: CaseEvidence) -> dict[str, datetime | None]:
-    order = store.order() or {}
-    ship = store.shipment()
-    merged = {**{str(k).lower(): v for k, v in order.items()}}
-    merged.update({str(k).lower(): v for k, v in ship.items() if not isinstance(v, (list, dict))})
-    limits = [_time(v) for v in _walk(store.data("get_order_items"), {"shipping_limit_date"})]
-    limits += [_time(v) for v in _walk(ship, {"shipping_limit_date", "seller_handoff_limit"})]
-    limits = [t for t in limits if t]
-
-    def pick(*keys: str) -> datetime | None:
-        for key in keys:
-            if (value := _time(merged.get(key))) is not None:
-                return value
-        for value in _walk(ship, set(keys)):
-            if (parsed := _time(value)) is not None:
-                return parsed
-        return None
-
-    return {
-        "delivered": pick("order_delivered_customer_date", "delivered_customer_at", "delivered_at"),
-        "estimated": pick(
-            "order_estimated_delivery_date", "estimated_delivery_date", "estimated_delivery_at"
-        ),
-        "carrier": pick(
-            "order_delivered_carrier_date", "delivered_carrier_at", "carrier_handoff_at"
-        ),
-        "limit": min(limits) if limits else None,
-    }
-
-
-def _late_seller_id(store: CaseEvidence, handoff: datetime | None) -> str | None:
-    items = store.items()
-    late = [
-        item
-        for item in items
-        if handoff and (limit := _time(_first(item, "shipping_limit_date"))) and handoff > limit
-    ]
-    candidates = _strings([_first(i, "seller_id") for i in (late or items)])
-    return candidates[0] if candidates else None
-
-
-def _late_compensation(store: CaseEvidence) -> float:
-    """Bồi thường trễ giao theo policy công khai: hoàn phí vận chuyển nếu policy quy định."""
-    rules = _walk(store.data("get_policy"), {"late_delivery"})
-    if not any("freight" in json.dumps(rule).lower() for rule in rules):
-        return 0.0
-    return _money(sum(_number(_first(i, "freight_value")) or 0.0 for i in store.items()))
 
 
 def _detect_late_delivery(store: CaseEvidence) -> Finding | None:
-    times = _delivery_times(store)
-    delivered, estimated = times["delivered"], times["estimated"]
+    order = store.order() or {}
+    delivered = _time(_first(order, "order_delivered_customer_date"))
+    estimated = _time(_first(order, "order_estimated_delivery_date"))
+    shipment = store.shipment()
+    delivered = delivered or _time(_first(shipment, "delivered_customer_at"))
+    estimated = estimated or _time(_first(shipment, "estimated_delivery_at"))
     if not delivered or not estimated or delivered <= estimated:
         return None
-    carrier, limit = times["carrier"], times["limit"]
-    seller_late = bool(carrier and limit and carrier > limit)
-    if seller_late:
-        seller_id = _late_seller_id(store, carrier)
+
+    carrier = _time(_first(order, "order_delivered_carrier_date")) or _time(
+        _first(shipment, "delivered_carrier_at")
+    )
+    limits = _relevant_shipping_limits(store)
+    late_limits = [
+        s
+        for s in limits
+        if carrier
+        and (limit := _time(_first(s, "shipping_limit_at", "shipping_limit_date")))
+        and carrier > limit
+    ]
+    event_actors = {_lower(_first(e, "actor")) for e in _relevant_shipment_events(store)}
+    seller_fault = bool(late_limits) or ("seller" in event_actors and not limits)
+    # Hai nguồn (mốc thời gian và event của shipment) phải thống nhất mới cho confidence cao.
+    agrees = ("seller" in event_actors) == seller_fault if event_actors else True
+    confidence = 0.9 if agrees else 0.65
+    freight = round(
+        sum(_number(_first(i, "freight_value")) or 0.0 for i in _dedupe(_relevant_items(store))), 2
+    )
+    captured = _sum(_relevant_captures(store))
+    if captured > MONEY_TOLERANCE:
+        # Chỉ hoàn phần phí vận chuyển thực sự đã thu.
+        freight = min(freight, captured)
+    if seller_fault:
+        sellers = _strings([_first(s, "seller_id") for s in late_limits or limits])
         return Finding(
             issue="late_delivery_seller",
-            case_status="action_required",
-            party_type="seller",
-            party_id=seller_id,
             cause_code="SELLER_HANDOFF_AFTER_LIMIT",
-            confidence=0.85 if seller_id else 0.7,
-            tools=(
-                "get_order",
-                "get_order_items",
-                "get_shipment_summary",
-                "get_sellers",
-                "get_policy",
-            ),
-            refund=_late_compensation(store),
-            refund_reason="LATE_DELIVERY_FREIGHT_REFUND",
-            refund_entity=store.order_id,
-            actions=("compensate_late_delivery", "notify_seller_sla_breach"),
+            confidence=confidence,
+            evidence_amount=freight,
+            party_id=sellers[0] if sellers else None,
+            tools=("get_order", "get_order_items", "get_shipment_summary", "get_sellers"),
         )
     return Finding(
         issue="late_delivery_logistics",
-        case_status="action_required",
-        party_type="logistics_provider",
         cause_code="CARRIER_DELIVERY_DELAY",
-        confidence=0.85 if carrier and limit else 0.65,
-        tools=("get_order", "get_shipment_summary", "get_order_items", "get_policy"),
-        refund=_late_compensation(store),
-        refund_reason="LATE_DELIVERY_FREIGHT_REFUND",
-        refund_entity=store.order_id,
-        actions=("compensate_late_delivery", "escalate_to_logistics_provider"),
-    )
-
-
-def _detect_duplicate_charge(store: CaseEvidence) -> Finding | None:
-    captures: list[tuple[str, float]] = []
-    for event in store.payment_events():
-        kind = _event_kind(event)
-        if not any(word in kind for word in ("capture", "charge")):
-            continue
-        amount = _event_amount(event)
-        if amount is None:
-            continue
-        key = _lower(
-            _first(event, "payment_reference", "payment_id", "payment_sequential", "reference")
-        )
-        captures.append((key, amount))
-    seen: dict[tuple[str, float], int] = {}
-    for key, amount in captures:
-        seen[(key, round(amount, 2))] = seen.get((key, round(amount, 2)), 0) + 1
-    duplicated = sum(amount * (count - 1) for (_, amount), count in seen.items() if count > 1)
-    if duplicated <= MONEY_TOLERANCE and "duplicate" not in " ".join(
-        _event_kind(e) for e in store.payment_events()
-    ):
-        return None
-    if duplicated <= MONEY_TOLERANCE:
-        dup_events = [e for e in store.payment_events() if "duplicate" in _event_kind(e)]
-        duplicated = sum(_event_amount(e) or 0.0 for e in dup_events)
-    return Finding(
-        issue="duplicate_charge",
-        case_status="action_required",
-        party_type="payment_provider",
-        cause_code="DUPLICATE_CAPTURE",
-        confidence=0.9,
-        refund=_money(duplicated),
-        refund_reason="DUPLICATE_CAPTURE_REFUND",
-        refund_entity=store.order_id,
-        tools=("get_order_payments", "get_payment_timeline"),
-        actions=("refund_duplicate_charge",),
+        confidence=confidence,
+        evidence_amount=freight,
+        tools=("get_order", "get_order_items", "get_shipment_summary"),
     )
 
 
 def _detect_refund_problem(store: CaseEvidence) -> Finding | None:
-    events = store.refund_events() or [
-        e for e in store.payment_events() if "refund" in _event_kind(e)
-    ]
-    if not events:
+    refunds = _relevant_refunds(store)
+    if not refunds:
         return None
-    statuses = " ".join(
-        _lower(_first(e, "status", "refund_status")) + " " + _event_kind(e) for e in events
-    )
-    amounts = [a for e in events if (a := _event_amount(e)) is not None]
-    amount = _money(max(amounts)) if amounts else 0.0
-    completed = any(s in statuses for s in ("completed", "succeeded", "refunded"))
-    if any(s in statuses for s in ("failed", "rejected", "declined", "error")) and not completed:
+    statuses = {_lower(_first(r, "status")) for r in refunds}
+    if statuses & {"completed", "succeeded", "refunded", "settled"}:
+        return None
+    amount = round(max(_event_amount(r) or 0.0 for r in refunds), 2)
+    if statuses & {"failed", "rejected", "declined", "error"}:
         return Finding(
             issue="refund_failed",
-            case_status="action_required",
-            party_type="payment_provider",
             cause_code="REFUND_PROCESSING_FAILED",
-            confidence=0.85,
-            refund=amount,
-            refund_reason="RETRY_FAILED_REFUND",
-            refund_entity=store.order_id,
-            tools=("get_refund_timeline", "get_payment_timeline"),
-            actions=("retry_refund",),
+            confidence=0.9,
+            evidence_amount=amount,
+            tools=("get_refund_timeline", *PAYMENT_TOOLS),
         )
-    if any(s in statuses for s in ("pending", "requested", "initiated", "processing")) and not (
-        completed
-    ):
+    if statuses & {"pending", "requested", "processing", "initiated"}:
         return Finding(
             issue="refund_pending",
-            case_status="needs_investigation",
-            party_type="payment_provider",
             cause_code="REFUND_NOT_SETTLED",
-            confidence=0.8,
-            tools=("get_refund_timeline", "get_payment_timeline"),
-            actions=("monitor_refund_settlement",),
+            confidence=0.85,
+            evidence_amount=amount,
+            tools=("get_refund_timeline", *PAYMENT_TOOLS),
         )
     return None
 
 
-def _detect_payment_amounts(store: CaseEvidence) -> Finding | None:
-    expected = store.items_total()
-    paid = _captured_total(store)
-    payments = store.base_payments()
-    if expected is None or paid is None:
+def _detect_mismatch(store: CaseEvidence) -> Finding | None:
+    flags = [
+        e
+        for e in _relevant_payment_events(store)
+        if "mismatch" in _event_kind(e)
+        and _lower(_first(e, "status")) not in {"closed", "resolved"}
+    ]
+    if not flags:
         return None
-    difference = round(paid - expected, 2)
-    if abs(difference) > MONEY_TOLERANCE:
-        overcharge = _money(difference)
-        return Finding(
-            issue="payment_mismatch",
-            case_status="action_required" if overcharge > 0 else "needs_investigation",
-            party_type="payment_provider",
-            cause_code="CAPTURED_AMOUNT_MISMATCH",
-            confidence=0.8,
-            refund=overcharge,
-            refund_reason="OVERCHARGE_REFUND",
-            refund_entity=store.order_id,
-            tools=("get_order_items", "get_order_payments", "get_payment_timeline"),
-            actions=("refund_overcharge",) if overcharge > 0 else ("reconcile_payment",),
-            conflicts=[
-                {
-                    "field": "order_total_brl",
-                    "sources": ["get_order_items", "get_order_payments"],
-                    "selected_source": "get_order_items",
-                    "resolution_code": "ITEM_TOTAL_IS_AUTHORITATIVE",
-                }
-            ],
-        )
-    if len(payments) > 1:
+    amount = round(max(_event_amount(e) or 0.0 for e in flags), 2)
+    expected = _item_total(_relevant_items(store))
+    captured = _sum(_relevant_captures(store))
+    return Finding(
+        issue="payment_mismatch",
+        cause_code="PAYMENT_RECONCILIATION_MISMATCH",
+        confidence=0.9,
+        evidence_amount=amount,
+        tools=("get_order_items", *PAYMENT_TOOLS),
+        conflicts=[
+            {
+                "field": "captured_amount_brl",
+                "sources": ["get_order_items", "get_payment_timeline"],
+                "selected_source": "get_payment_timeline",
+                "resolution_code": "RECONCILIATION_EVENT_OPEN",
+            }
+        ]
+        if abs(expected - captured) > MONEY_TOLERANCE
+        else [],
+    )
+
+
+def _detect_capture_pattern(store: CaseEvidence) -> Finding | None:
+    """Nhiều capture trong cửa sổ: khớp tổng đơn là split; cùng số tiền và vượt tổng là trùng."""
+    captures = _relevant_captures(store)
+    if len(captures) < 2:
+        return None
+    expected = _item_total(_relevant_items(store))
+    captured = _sum(captures)
+    amounts = [round(_event_amount(c) or 0.0, 2) for c in captures]
+    if expected and abs(captured - expected) <= MONEY_TOLERANCE:
         return Finding(
             issue="valid_split_payment",
-            case_status="no_action",
-            party_type="customer",
             cause_code="LEGITIMATE_SPLIT_PAYMENT",
+            confidence=0.9,
+            tools=("get_order_items", *PAYMENT_TOOLS),
+        )
+    repeated = [a for a in set(amounts) if amounts.count(a) > 1]
+    if repeated and captured > expected + MONEY_TOLERANCE:
+        return Finding(
+            issue="duplicate_charge",
+            cause_code="DUPLICATE_CAPTURE",
             confidence=0.85,
-            tools=("get_order_items", "get_order_payments"),
-            actions=("no_action_required",),
+            evidence_amount=max(repeated),
+            tools=("get_order_items", *PAYMENT_TOOLS),
         )
     return None
 
 
-def _detect(store: CaseEvidence, claimed: str | None) -> Finding | None:
-    """Ưu tiên kiểm chứng giả thuyết của khách, sau đó quét các issue còn lại."""
-    detectors = {
-        "canceled_order_paid": lambda: _detect_paid_but_not_fulfilled(
-            store, "canceled", "canceled_order_paid"
-        ),
-        "unavailable_order_paid": lambda: _detect_paid_but_not_fulfilled(
-            store, "unavailable", "unavailable_order_paid"
-        ),
-        "late_delivery_seller": lambda: _detect_late_delivery(store),
-        "late_delivery_logistics": lambda: _detect_late_delivery(store),
-        "duplicate_charge": lambda: _detect_duplicate_charge(store),
-        "refund_pending": lambda: _detect_refund_problem(store),
-        "refund_failed": lambda: _detect_refund_problem(store),
-        "payment_mismatch": lambda: _detect_payment_amounts(store),
-        "valid_split_payment": lambda: _detect_payment_amounts(store),
-    }
-    order = [claimed] if claimed in detectors else []
-    order += [name for name in detectors if name not in order]
-    for name in order:
-        finding = detectors[name]()
+def _detect(store: CaseEvidence) -> Finding | None:
+    for detector in (
+        _detect_unfulfilled,
+        _detect_late_delivery,
+        _detect_refund_problem,
+        _detect_mismatch,
+        _detect_capture_pattern,
+    ):
+        finding = detector(store)
         if finding:
             return finding
     return None
-
-
-def _unsupported(store: CaseEvidence) -> Finding:
-    return Finding(
-        issue="unsupported_claim",
-        case_status="no_action",
-        party_type="customer",
-        cause_code="CLAIM_CONTRADICTED_BY_EVIDENCE",
-        confidence=0.75,
-        tools=("get_order", "get_order_payments", "get_shipment_summary"),
-        actions=("no_action_required",),
-    )
-
-
-def _insufficient() -> Finding:
-    return Finding(
-        issue="insufficient_evidence",
-        case_status="needs_investigation",
-        party_type="unknown",
-        cause_code="EVIDENCE_UNAVAILABLE",
-        confidence=0.3,
-        tools=("get_order",),
-        actions=("collect_additional_evidence",),
-    )
 
 
 # ---------------------------------------------------------------------------
 # Policy + verifier
 # ---------------------------------------------------------------------------
 
+DEFAULT_RULES: dict[str, dict[str, Any]] = {
+    "canceled_order_paid": {
+        "case_status": "action_required",
+        "action": "issue_refund",
+        "party": "platform",
+    },
+    "unavailable_order_paid": {
+        "case_status": "action_required",
+        "action": "issue_refund",
+        "party": "seller",
+    },
+    "late_delivery_seller": {
+        "case_status": "action_required",
+        "action": "refund_freight",
+        "party": "seller",
+    },
+    "late_delivery_logistics": {
+        "case_status": "action_required",
+        "action": "refund_freight",
+        "party": "logistics_provider",
+    },
+    "duplicate_charge": {
+        "case_status": "action_required",
+        "action": "refund_duplicate_charge",
+        "party": "payment_provider",
+    },
+    "payment_mismatch": {
+        "case_status": "action_required",
+        "action": "reconcile_payment",
+        "party": "payment_provider",
+    },
+    "refund_failed": {
+        "case_status": "action_required",
+        "action": "retry_refund",
+        "party": "payment_provider",
+    },
+    "refund_pending": {
+        "case_status": "needs_investigation",
+        "action": "monitor_refund",
+        "party": "payment_provider",
+        "no_refund": True,
+    },
+    "valid_split_payment": {
+        "case_status": "no_action",
+        "action": "document_no_action",
+        "party": "customer",
+        "no_refund": True,
+    },
+    "unsupported_claim": {
+        "case_status": "no_action",
+        "action": "document_no_action",
+        "party": "customer",
+        "no_refund": True,
+    },
+    "insufficient_evidence": {
+        "case_status": "needs_investigation",
+        "action": "collect_additional_evidence",
+        "party": "unknown",
+        "no_refund": True,
+    },
+}
+
+
+def _policy_rule(store: CaseEvidence, issue: str) -> dict[str, Any] | None:
+    data = store.data("get_policy")
+    rules = data.get("rules") if isinstance(data, dict) else None
+    rule = rules.get(issue) if isinstance(rules, dict) else None
+    return rule if isinstance(rule, dict) else None
+
+
+def _apply_policy(store: CaseEvidence, finding: Finding) -> Finding:
+    """Trạng thái, action, bên chịu trách nhiệm và số tiền hoàn theo policy công khai."""
+    default = DEFAULT_RULES[finding.issue]
+    rule = _policy_rule(store, finding.issue)
+    finding.case_status = (rule or {}).get("case_status") or default["case_status"]
+    finding.actions = ((rule or {}).get("recommended_action") or default["action"],)
+    parties = (rule or {}).get("responsible_parties") or []
+    finding.party_type = (
+        parties[0].get("party_type") if parties and isinstance(parties[0], dict) else None
+    ) or default["party"]
+    if finding.party_type != "seller":
+        finding.party_id = None
+
+    policy_refund = _number((rule or {}).get("refund_brl"))
+    if default.get("no_refund") or finding.case_status == "no_action":
+        finding.refund = 0.0
+    elif policy_refund is not None:
+        finding.refund = _money(policy_refund)
+        if finding.evidence_amount and abs(finding.evidence_amount - policy_refund) > 0.01:
+            # Policy là nguồn chuẩn cho số tiền; evidence lệch thì hạ nhẹ confidence.
+            finding.confidence = min(finding.confidence, 0.8)
+    else:
+        finding.refund = _money(finding.evidence_amount)
+    if "get_policy" not in finding.tools and rule is not None:
+        finding.tools = (*finding.tools, "get_policy")
+    return finding
+
 
 def _policy_decision(store: CaseEvidence, claimed: str | None) -> Finding:
     if not store.by_tool.get("get_order"):
-        return _insufficient()
-    finding = _detect(store, claimed)
+        finding = Finding(
+            issue="insufficient_evidence",
+            cause_code="EVIDENCE_UNAVAILABLE",
+            confidence=0.3,
+            tools=("get_order",),
+        )
+        return _apply_policy(store, finding)
+    finding = _detect(store)
     if finding is None:
-        return _unsupported(store)
-    if claimed and claimed != finding.issue and claimed in ISSUE_TOPICS:
-        finding.confidence = min(finding.confidence, 0.75)
-    return finding
+        finding = Finding(
+            issue="unsupported_claim",
+            cause_code="CLAIM_NOT_SUPPORTED_BY_EVIDENCE",
+            confidence=0.85 if claimed in {None, "unsupported_claim"} else 0.7,
+            tools=("get_order", "get_shipment_summary", *PAYMENT_TOOLS),
+        )
+    elif claimed and claimed in ISSUE_TOPICS and claimed != finding.issue:
+        # Evidence mâu thuẫn với claim: vẫn theo evidence, nhưng bớt chắc chắn.
+        finding.confidence = min(finding.confidence, 0.7)
+    return _apply_policy(store, finding)
 
 
 def _verify(finding: Finding, store: CaseEvidence) -> tuple[Finding, list[str]]:
@@ -715,8 +803,8 @@ def _verify(finding: Finding, store: CaseEvidence) -> tuple[Finding, list[str]]:
         adjustments.append("REFUND_CLEARED_FOR_NO_ACTION")
     if finding.party_type == "seller" and not finding.party_id:
         sellers = _strings(
-            _walk(store.data("get_sellers"), {"seller_id"})
-            + _walk(store.data("get_order_items"), {"seller_id"})
+            [_first(i, "seller_id") for i in _relevant_items(store)]
+            + _walk(store.data("get_sellers"), {"seller_id"})
         )
         if sellers:
             finding.party_id = sellers[0]
@@ -761,7 +849,7 @@ def _entities(store: CaseEvidence, finding: Finding) -> dict[str, list[str]]:
     if not item_ids:
         item_ids = _strings(_walk(store.data("get_order_items"), {"order_item_id"}))
     seller_ids = _strings(
-        _walk(store.data("get_order_items"), {"seller_id"})
+        [_first(i, "seller_id") for i in _relevant_items(store)]
         + _walk(store.data("get_sellers"), {"seller_id"})
     )
     if finding.party_type == "seller" and finding.party_id:
@@ -811,12 +899,12 @@ def _claim_assessments(
             else:
                 verdict, confidence = "unsupported", finding.confidence
         elif topic == "requested_full_refund":
-            paid = _captured_total(store) or 0.0
-            if finding.refund <= MONEY_TOLERANCE:
+            if finding.refund <= MONEY_TOLERANCE and finding.issue != "refund_pending":
                 verdict = "unsupported"
-            elif paid and finding.refund + MONEY_TOLERANCE >= paid:
+            elif finding.issue in FULL_REFUND_ISSUES:
                 verdict = "supported"
             else:
+                # Chỉ hoàn một phần (phí ship, khoản trùng/chênh lệch) hoặc refund đang xử lý.
                 verdict = "partially_supported"
             confidence = finding.confidence * 0.9
         else:
@@ -839,14 +927,12 @@ def _build_output(
     if finding.refund > MONEY_TOLERANCE:
         refund_lines.append(
             {
-                "reason_code": finding.refund_reason or finding.cause_code,
+                "reason_code": finding.actions[0] if finding.actions else finding.cause_code,
                 "amount_brl": _money(finding.refund),
-                "entity_id": finding.refund_entity,
+                "entity_id": store.order_id,
             }
         )
     actions = list(dict.fromkeys(finding.actions)) or ["investigate_case"]
-    if finding.case_status == "no_action":
-        actions = ["no_action_required"]
     output: dict[str, Any] = {
         "schema_version": "day09-l3a-output-v2",
         "case_id": store.case_id,

@@ -2,19 +2,18 @@
 
 ## Trạng thái hiện tại
 
-Các bước 1–10 đã được thực hiện. Pipeline đã chạy trọn 100 case, validate và đóng gói thành công với **MCP server local** (`scripts/local_mcp_server.py`), vì server thi trả `Error executing tool` cho mọi call. File `dist/submission-local.zip` chỉ để kiểm thử: evidence ref của server local không có trong audit của server thi, nên **không nộp file này**.
+Đã hoàn thành các bước 1–10. Lần chạy sạch trên server thi cho 100/100 case, `day09 validate` và `scripts/self_check.py` đều đạt, và bài nộp nằm ở `dist/submission.zip`. Việc còn lại là upload file này tại workspace `/l3a` và chọn nó làm final submission.
 
-Khi server thi hoạt động lại, tạo bài nộp thật bằng:
+Nếu cần chạy lại (sau khi sửa logic):
 
 ```bash
 source .venv/bin/activate
-python scripts/explore_case.py L3A_CASE_001 get_order   # phải thấy evidence_ref, không phải "error"
 rm -f outputs/*.json traces/trace.jsonl
 day09 run && day09 validate && python scripts/self_check.py
 day09 package --output dist/submission.zip
 ```
 
-Nếu tên trường trong dữ liệu thật khác dữ liệu mô phỏng (xem bằng `explore_case.py`), chỉnh các detector trong `src/student_agent/workflow.py`.
+`scripts/local_mcp_server.py` là server MCP local dùng để phát triển khi server thi lỗi. Evidence ref của nó không hợp lệ để nộp.
 
 Phần bên dưới là kế hoạch gốc, viết dựa trên trạng thái repo tại commit `629bb7b`. Nó gồm hai phần: đánh giá hiện trạng, rồi các bước cần làm theo thứ tự, mỗi bước có tiêu chí "xong".
 

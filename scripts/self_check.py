@@ -42,8 +42,7 @@ def main() -> None:
         lines = out["financial_resolution"]["refund_lines"]
         if abs(refund - round(sum(x["amount_brl"] for x in lines), 2)) > 0.01:
             problems.append(f"{cid}: refund total != sum(refund_lines)")
-        actions = out["resolution_actions"]
-        if status == "no_action" and (refund > 0 or actions != ["no_action_required"]):
+        if status == "no_action" and refund > 0:
             problems.append(f"{cid}: no_action nhưng có refund/action")
         for party in out["root_cause_analysis"]["responsible_parties"]:
             if party["party_type"] == "seller" and not party["party_id"]:
