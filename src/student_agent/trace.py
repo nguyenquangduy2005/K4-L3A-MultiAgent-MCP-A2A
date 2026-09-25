@@ -49,3 +49,15 @@ class TraceWriter:
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
         return event
+
+    def discard_case(self, case_id: str) -> None:
+        """Drop a case's events so an interrupted case can be re-run without duplicates."""
+        if not self.path.exists():
+            return
+        marker = f'"case_id":"{case_id}"'
+        kept = [
+            line
+            for line in self.path.read_text(encoding="utf-8").splitlines(keepends=True)
+            if marker not in line
+        ]
+        self.path.write_text("".join(kept), encoding="utf-8")

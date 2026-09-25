@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +12,15 @@ from . import OUTPUT_SCHEMA_VERSION, VARIANT_ID
 from .cases import CaseSet
 from .contracts import Contracts
 
+LIFECYCLE = (
+    "case_received",
+    "task_assigned",
+    "tool_result_consumed",
+    "handoff",
+    "policy_decided",
+    "verification_completed",
+    "case_finalized",
+)
 SECRET_PATTERN = re.compile(r"sk-team-[A-Za-z0-9_-]{8,}")
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SUBMISSION_BYTES = 12 * 1024 * 1024
@@ -24,6 +34,25 @@ def _json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path}: expected a JSON object")
     return value
+
+
+def lifecycle_problems(events: dict[str, list[str]]) -> tuple[list[str], list[str]]:
+    """Return (errors, warnings). Missing events or a wrong first/last event fail the scorer's
+    workflow checks; a mis-ordered middle of the lifecycle is reported as a warning."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    for case_id, types in events.items():
+        missing = [name for name in LIFECYCLE if name not in types]
+        if missing:
+            errors.append(f"{case_id}: missing events {missing}")
+            continue
+        if types[0] != "case_received" or types[-1] != "case_finalized":
+            errors.append(f"{case_id}: must start with case_received and end with case_finalized")
+            continue
+        firsts = [types.index(name) for name in LIFECYCLE]
+        if firsts != sorted(firsts):
+            warnings.append(f"{case_id}: lifecycle events are not in the expected order")
+    return errors, warnings
 
 
 def build_manifest(case_set: CaseSet) -> dict[str, Any]:
@@ -65,6 +94,7 @@ def validate_artifacts(
         raise ValueError("traces/trace.jsonl is missing or not UTF-8") from exc
     normalized_lines: list[str] = []
     seen_events: set[str] = set()
+    by_case: dict[str, list[str]] = {case_id: [] for case_id in case_set.case_ids}
     for number, line in enumerate(trace_lines, 1):
         if not line.strip():
             continue
@@ -78,7 +108,17 @@ def validate_artifacts(
         if event["event_id"] in seen_events:
             raise ValueError(f"traces/trace.jsonl:{number}: duplicate event_id")
         seen_events.add(event["event_id"])
+        by_case[event["case_id"]].append(event["event_type"])
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+
+    errors, warnings = lifecycle_problems(by_case)
+    if errors:
+        raise ValueError("trace lifecycle incomplete: " + "; ".join(errors[:5]))
+    if warnings:
+        print(
+            f"WARN: {len(warnings)} cases with out-of-order lifecycle, e.g. {warnings[0]}",
+            file=sys.stderr,
+        )
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
