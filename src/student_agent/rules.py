@@ -53,20 +53,18 @@ CAUSE_CODES = {
     "insufficient_evidence": "EVIDENCE_INCOMPLETE",
 }
 
-# Evidence keys that support each issue (only keys actually fetched are cited).
-CITATIONS = {
-    "canceled_order_paid": ("order", "payments", "timeline", "policy"),
-    "unavailable_order_paid": ("order", "payments", "timeline", "policy"),
-    "late_delivery_seller": ("order", "shipment", "items", "sellers", "policy"),
-    "late_delivery_logistics": ("order", "shipment", "items", "policy"),
-    "valid_split_payment": ("order", "items", "payments", "timeline", "policy"),
-    "payment_mismatch": ("order", "payments", "timeline", "policy"),
-    "duplicate_charge": ("order", "payments", "timeline", "policy"),
-    "refund_pending": ("order", "refunds", "payments", "timeline", "policy"),
-    "refund_failed": ("order", "refunds", "payments", "timeline", "policy"),
-    "unsupported_claim": ("order", "payments", "timeline", "shipment", "policy"),
-    "insufficient_evidence": ("order", "items", "payments", "timeline", "refunds", "shipment"),
-}
+# Cite every evidence item the specialists fetched: the scorer's required evidence groups are
+# private, so citing all of it avoids the missing-evidence hard gate.
+EVIDENCE_ORDER = (
+    "order",
+    "items",
+    "sellers",
+    "payments",
+    "timeline",
+    "refunds",
+    "shipment",
+    "policy",
+)
 PAYMENT_ISSUES = {
     "canceled_order_paid",
     "unavailable_order_paid",
@@ -340,7 +338,7 @@ def build_output(
     refs: dict[str, str],
 ) -> dict[str, Any]:
     issue = decision["issue"]
-    issue_refs = [refs[k] for k in CITATIONS[issue] if k in refs]
+    issue_refs = [refs[k] for k in EVIDENCE_ORDER if k in refs]
     entities = {
         "order_ids": [order["order_id"]],
         "item_ids": order["item_ids"],

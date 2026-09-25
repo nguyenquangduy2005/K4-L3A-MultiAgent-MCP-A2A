@@ -11,7 +11,7 @@ from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
-from .submission import package_submission, validate_artifacts
+from .submission import package_submission, recite_outputs, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
 
@@ -116,6 +116,9 @@ def parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run the implemented workflow for all cases")
     run.add_argument("--force", action="store_true", help="overwrite even if many cases fell back")
     commands.add_parser("validate", help="validate outputs and observable trace")
+    commands.add_parser(
+        "recite", help="offline: cite all trace-consumed evidence in outputs (no MCP calls)"
+    )
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
     return result
@@ -139,6 +142,10 @@ def main() -> None:
             contracts = Contracts(root / "contracts" / "schemas")
             _, trace = validate_artifacts(root, case_set, contracts)
             print(f"OK: {len(case_set.case_ids)} outputs / {len(trace)} trace events")
+        elif args.command == "recite":
+            case_set = load_case_set(root)
+            contracts = Contracts(root / "contracts" / "schemas")
+            print(f"OK: updated {recite_outputs(root, case_set, contracts)} outputs")
         elif args.command == "package":
             destination = package_submission(root, root / args.output)
             print(f"OK: {destination}")

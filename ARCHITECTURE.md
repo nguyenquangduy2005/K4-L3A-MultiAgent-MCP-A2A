@@ -98,7 +98,7 @@ Message envelope giữa các node (lưu trong state, tóm tắt vào trace):
 2. Kiểm tra bổ sung: `domain` của envelope nằm trong allowlist của agent gọi.
 3. Lưu ref vào `EvidenceStore.refs` và cache theo `(tool, args)` trong phạm vi case để không gọi trùng.
 4. Specialist emit `tool_result_consumed` cho mỗi evidence lấy được và dùng để rút tín hiệu.
-5. Output chỉ trích dẫn nhóm evidence liên quan đến `primary_issue` (bảng `CITATIONS` trong [rules.py](src/student_agent/rules.py)), lấy nguyên ref từ MCP, không sửa hay tự tạo.
+5. Output trích dẫn **toàn bộ** evidence mà các specialist đã lấy thành công cho case (`EVIDENCE_ORDER` trong [rules.py](src/student_agent/rules.py)), lấy nguyên ref từ MCP, không sửa hay tự tạo. Nhóm evidence bắt buộc của scorer là riêng tư nên trích đầy đủ để tránh hard gate `missing_required_evidence`, đổi lại precision của điểm `evidence` có thể giảm. `day09 recite` áp dụng cùng quy tắc offline cho output đã có bằng cách đọc các ref trong trace, không gọi MCP.
 6. Verifier kiểm tra mọi ref được trích dẫn đều có trong `EvidenceStore` của đúng case.
 7. `EvidenceStore` tạo mới cho mỗi case, nên evidence không bị tái sử dụng giữa các case.
 

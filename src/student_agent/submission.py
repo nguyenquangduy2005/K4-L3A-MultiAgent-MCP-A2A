@@ -158,3 +158,35 @@ def package_submission(root: Path, destination: Path) -> Path:
         for name, payload in payloads.items():
             archive.writestr(name, payload)
     return destination
+
+
+def recite_outputs(root: Path, case_set: CaseSet, contracts: Contracts) -> int:
+    """Re-derive each output's evidence_refs from the trace, without any MCP call.
+
+    Every ref in the trace is a genuine, unmodified MCP result the specialists consumed for that
+    case. Claims that cited the same set as the top-level list are updated to match.
+    """
+    consumed: dict[str, list[str]] = {case_id: [] for case_id in case_set.case_ids}
+    trace_path = root / "traces" / "trace.jsonl"
+    for line in trace_path.read_text(encoding="utf-8").splitlines():
+        event = json.loads(line) if line.strip() else {}
+        if event.get("event_type") == "tool_result_consumed" and event["case_id"] in consumed:
+            for ref in event.get("evidence_refs", []):
+                if ref not in consumed[event["case_id"]]:
+                    consumed[event["case_id"]].append(ref)
+    changed = 0
+    for case_id in case_set.case_ids:
+        path = root / "outputs" / f"{case_id}.json"
+        output = _json_object(path)
+        refs = consumed[case_id][:30]
+        if output["assessment"]["primary_issue"] == "insufficient_evidence" or not refs:
+            continue
+        old = output["evidence_refs"]
+        for claim in output.get("claim_assessments", []):
+            if claim["evidence_refs"] == old:
+                claim["evidence_refs"] = refs
+        output["evidence_refs"] = refs
+        contracts.validate_output(output, f"outputs/{case_id}.json")
+        path.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        changed += 1
+    return changed

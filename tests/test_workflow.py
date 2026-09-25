@@ -257,3 +257,8 @@ def test_confidence_drops_only_for_an_unbacked_refund_amount(tmp_path: Path) -> 
     doubtful, _ = run_case(gateway, tmp_path / "b")
     assert doubtful["assessment"]["confidence"] == 0.9
     assert doubtful["data_conflicts"][0]["resolution_code"] == "POLICY_AMOUNT_NOT_IN_EVIDENCE"
+
+
+def test_output_cites_every_evidence_the_specialists_consumed(tmp_path: Path) -> None:
+    output, events = run_case(FakeGateway("canceled"), tmp_path)
+    assert set(output["evidence_refs"]) == set(consumed_refs(events))
