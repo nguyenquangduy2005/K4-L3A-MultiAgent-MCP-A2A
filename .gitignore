@@ -34,3 +34,7 @@ dist/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local exploration output
+scratch/
+.local_mcp/

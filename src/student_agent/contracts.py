@@ -22,10 +22,7 @@ class Contracts:
         #   Contracts(Path("contracts"))
         # và:
         #   Contracts(Path("contracts/schemas"))
-        if (self.root / "schemas").is_dir():
-            schemas_root = self.root / "schemas"
-        else:
-            schemas_root = self.root
+        schemas_root = self.root / "schemas" if (self.root / "schemas").is_dir() else self.root
 
         schemas: dict[str, dict[str, Any]] = {}
         registry = Registry()

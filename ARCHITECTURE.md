@@ -10,106 +10,122 @@ Luồng từ `inputs/<case_id>.json` đến output và trace:
 inputs/<case_id>.json
    │
    ▼
-cli._run ──► _run_one_case (mở MCP session riêng, list_tools, tối đa 3 lần thử)
+cli._run ──► _run_one_case (MCP session riêng, list_tools, tối đa 3 lần thử, trace buffer theo case)
                  │
                  ▼
             workflow.solve_case
                  coordinator ── case_received
-                   ├─ task_assigned ─► order_agent    ── get_order, get_order_items
-                   ├─ handoff ───────► payment_agent  ── get_order_payments, get_payment_timeline
-                   ├─ handoff ───────► shipment_agent ── get_shipment_summary
-                   ├─ policy_agent   ── policy_decided
-                   ├─ handoff ───────► verifier       ── verification_completed
+                   ├─ task_assigned ─► order_agent    ── get_order, get_order_items      ─ handoff ─► coordinator
+                   ├─ task_assigned ─► seller_agent   ── get_sellers                     ─ handoff ─► coordinator
+                   ├─ task_assigned ─► payment_agent  ── get_order_payments, get_payment_timeline,
+                   │                                     (get_refund_timeline khi cần)   ─ handoff ─► coordinator
+                   ├─ task_assigned ─► shipment_agent ── get_shipment_summary            ─ handoff ─► coordinator
+                   ├─ task_assigned ─► policy_agent   ── get_policy ── policy_decided    ─ handoff ─► verifier
+                   └─ verifier ── verification_completed ─ handoff ─► coordinator
                  coordinator ── case_finalized
                  │
                  ▼
 contracts.validate_output ──► outputs/<case_id>.json (ghi .tmp rồi replace)
-TraceWriter.emit ───────────► traces/trace.jsonl (validate từng event)
+TraceWriter (buffer) ───────► traces/trace.jsonl (chỉ ghi khi case thành công)
 ```
 
-Mọi specialist gọi MCP qua `EvidenceGateway.call`. Gateway luôn gửi kèm `case_id` và validate evidence theo contract trước khi trả về cho agent.
+Mọi specialist gọi MCP qua `EvidenceGateway.call`. Gateway luôn gửi kèm `case_id` và validate evidence theo `day09-mcp-evidence-v1` trước khi trả về cho agent. Evidence của một case được giữ trong `CaseEvidence` (theo tên tool) và chỉ sống trong một lần gọi `solve_case`.
 
 ## 2. Agent ownership
 
 | Actor | Input | Trách nhiệm | Output/handoff |
 | --- | --- | --- | --- |
-| Coordinator | Case JSON | Nhận case, lấy `order_id` từ input, giao việc cho specialist theo thứ tự, gộp evidence, dựng output cuối | `task_assigned`/`handoff` tới specialist; `case_finalized` |
-| Order/item | `case_id`, `order_id` | Lấy trạng thái đơn và danh sách item | Evidence order + items; `order_ids`, `item_ids` |
-| Payment | `case_id`, `order_id` | Lấy các giao dịch thanh toán và timeline thanh toán | Evidence payments + timeline |
-| Shipment | `case_id`, `order_id` | Lấy tóm tắt vận chuyển | Evidence shipment |
-| Policy | Claims của case + toàn bộ evidence | Xác định `primary_issue`, `responsible_party`, `case_status`, `confidence`, actions | `policy_decided`; handoff tới verifier |
-| Verifier | Kết quả policy + `evidence_refs` | Giới hạn confidence khi thiếu evidence và kẹp về [0, 1] | `verification_completed` |
+| Coordinator | Case JSON | Lấy `claimed_order_id`, `claims`, `policy_version`; giao việc tuần tự; dựng output cuối | `case_received`, `task_assigned`, `case_finalized` |
+| order_agent | `case_id`, `order_id` | Trạng thái đơn, mốc thời gian, item, giá, phí vận chuyển, `shipping_limit_date` | handoff kèm ref + `order_status` |
+| seller_agent | `order_id` | Hồ sơ seller của các item | handoff kèm ref |
+| payment_agent | `order_id`, claim topics | Payment gốc, lifecycle event (authorized/captured/…); gọi `get_refund_timeline` khi timeline có refund hoặc claim liên quan refund/hủy đơn | handoff kèm ref |
+| shipment_agent | `order_id` | Ngày giao carrier, ngày giao khách, ngày dự kiến, shipment id | handoff kèm ref |
+| policy_agent | `policy_version` + toàn bộ evidence | Tra policy công khai, chạy detector, chọn `primary_issue`, bên chịu trách nhiệm, refund, actions, confidence | `policy_decided`; handoff tới verifier |
+| verifier | Finding + evidence | Kiểm tra invariant (mục 6), chỉnh nếu vi phạm | `verification_completed` với mã điều chỉnh hoặc `INVARIANTS_OK` |
 
-Quyền gọi tool (áp dụng trong `workflow.py`):
+Quyền gọi tool:
 
-| Actor | Tool được gọi |
+| Actor | Tool |
 | --- | --- |
 | order_agent | `get_order`, `get_order_items` |
-| payment_agent | `get_order_payments`, `get_payment_timeline` |
+| seller_agent | `get_sellers` |
+| payment_agent | `get_order_payments`, `get_payment_timeline`, `get_refund_timeline` |
 | shipment_agent | `get_shipment_summary` |
-| coordinator, policy_agent, verifier | Không gọi MCP, chỉ dùng evidence đã được specialist lấy |
+| policy_agent | `get_policy` |
+| coordinator, verifier | Không gọi MCP |
 
-Các tool còn lại trên gateway (`get_policy`, `get_sellers`, `get_refund_timeline`, `get_customer_history`, `get_product_context`) hiện chưa được agent nào sử dụng.
+Không dùng `get_customer_history` và `get_product_context`: mọi case đều có `claimed_order_id` và không có kết luận nào cần dữ liệu sản phẩm, nên gọi thêm chỉ làm loãng evidence.
 
 ## 3. A2A protocol
 
-- **Envelope:** mỗi message là một trace event `day09-trace-event-v1`, gồm `event_id` ngẫu nhiên, `case_id`, `event_type`, `actor`, `occurred_at` và các trường tùy chọn `target`, `tool_name`, `decision_code`, `evidence_refs`, `attributes`.
-- **Correlation:** mọi event và mọi MCP call đều mang `case_id` của case đang xử lý. Mỗi case dùng một MCP session riêng.
-- **Handoff:** coordinator chuyển tuần tự order → payment → shipment. Mỗi handoff kèm `evidence_refs` mà bước trước đã thu thập. Policy chuyển sang verifier kèm `decision_code`.
-- **Tránh vòng lặp:** luồng là một pipeline tuyến tính cố định, không có agent nào gọi ngược lại agent trước.
-- **Timeout:** HTTP client dùng timeout đọc 300s, kết nối/ghi/pool 30s (`mcp_gateway.connect_gateway`).
-- Trace chỉ ghi sự kiện và decision code quan sát được, không ghi prompt hay nội dung suy luận.
+- **Envelope:** mỗi message là một trace event `day09-trace-event-v1` (`event_id` ngẫu nhiên, `case_id`, `event_type`, `actor`, `occurred_at`, và tùy chọn `target`, `tool_name`, `decision_code`, `evidence_refs`, `attributes`).
+- **Giao việc / trả kết quả:** coordinator phát `task_assigned` (target = agent); agent làm xong phát `handoff` về coordinator kèm các ref nó đã lấy. Policy handoff sang verifier kèm `decision_code`; verifier handoff về coordinator.
+- **Correlation:** mọi event và MCP call mang `case_id` của case đang xử lý; mỗi case một MCP session.
+- **Tránh vòng lặp:** pipeline tuyến tính cố định, không agent nào gọi ngược agent trước.
+- **Timeout:** HTTP đọc 300s, connect/write/pool 30s (`mcp_gateway.connect_gateway`).
+- Trace chỉ ghi sự kiện và decision code quan sát được (vd `attributes.domain`, `case_status`, `refund_brl`), không ghi prompt hay nội dung suy luận.
 
 ## 4. Evidence lifecycle
 
 1. Specialist gọi `gateway.call(tool, case_id=..., order_id=...)`.
-2. Gateway đọc `structuredContent` (hoặc một text block JSON duy nhất) và chạy `contracts.validate_evidence`. Response không hợp lệ sẽ gây exception.
-3. `_find_refs` lấy `evidence_ref` từ response. Hệ thống không tự tạo hay sửa ref.
-4. Ngay sau mỗi call, specialist emit `tool_result_consumed` kèm `tool_name` và ref vừa nhận.
-5. Coordinator gộp và khử trùng lặp ref từ tất cả specialist, rồi đưa vào `evidence_refs` của output (tối đa 30) và của từng claim assessment (tối đa 10).
-6. Evidence chỉ sống trong phạm vi một lần gọi `solve_case`, không được lưu hay dùng lại giữa các case.
+2. Gateway đọc `structuredContent` (hoặc một text block JSON) và chạy `contracts.validate_evidence`.
+3. Ngay sau call, specialist emit `tool_result_consumed` với `tool_name`, đúng ref vừa nhận và `domain`.
+4. Policy agent chọn các tool **thật sự hỗ trợ** kết luận (vd duplicate charge → payments + payment timeline; late delivery seller → order, items, shipment, sellers, policy). Chỉ ref của các tool đó được cite trong `evidence_refs` và `claim_assessments`; nếu các tool đó không có ref thì dùng domain liên quan (`ISSUE_DOMAINS`).
+5. Hệ thống không tự tạo, sửa hay dùng lại ref giữa các case.
 
 ## 5. Failure policy
 
-| Failure | Retry? | Fallback | Trace event/code |
+| Failure | Retry? | Fallback | Trace |
 | --- | --- | --- | --- |
-| MCP timeout | Có, tối đa 3 lần/case, chờ 2s × lần thử | Sau 3 lần: bỏ case, in `[FAILED]`, chạy tiếp case sau | Không có event riêng; log `[WARN]`/`[RETRY]` ra stderr |
-| Not found | Có (tool lỗi → `RuntimeError`) | Như trên; case không có output | Không có event riêng |
-| Source conflict | Không | Chưa xử lý; `data_conflicts` luôn rỗng | — |
-| Invalid specialist result | Có (evidence sai contract → exception) | Như trên | Không có event riêng |
-| Thiếu `order_id` trong input | Có, nhưng lần nào cũng lỗi giống nhau | Case thất bại | — |
-| Không có evidence ref | Không | Policy trả `insufficient_evidence`, confidence ≤ 0.30 | `policy_decided` với `insufficient_evidence` |
+| `get_order` lỗi / timeout | Có, tối đa 3 lần/case, chờ 2s × lần thử | Sau 3 lần: bỏ case, in `[FAILED]`, chạy tiếp | Event của lần thử lỗi bị bỏ (buffer) |
+| Tool phụ lỗi (not found…) | Không | Bỏ qua tool đó, detector làm việc với evidence còn lại | Không có `tool_result_consumed` cho tool đó |
+| Evidence sai contract | Có (exception → retry case) | Như dòng 1 | Như dòng 1 |
+| Không detector nào khớp | Không | `unsupported_claim`, `no_action`, confidence 0.75 | `policy_decided` |
+| Không có `get_order` | Không | `insufficient_evidence`, confidence 0.30 | `policy_decided` |
+| Source conflict (tổng payment ≠ tổng item) | Không | Chọn tổng item làm chuẩn, ghi `data_conflicts` | `policy_decided` |
 
-Mọi MCP call đều là thao tác đọc nên retry là idempotent. Output hợp lệ đã có sẵn sẽ được bỏ qua khi chạy lại. Hạn chế đã biết: event của lần thử thất bại vẫn nằm trong `trace.jsonl`.
+Mọi MCP call là thao tác đọc nên retry idempotent. `day09 run` bỏ qua case đã có output hợp lệ; sau khi sửa logic phải xóa `outputs/*.json` và `traces/trace.jsonl` rồi chạy lại toàn bộ.
 
-## 6. Verification invariants
+## 6. Policy và verification invariants
 
-Được kiểm tra trước khi ghi output:
+Detector (trong `workflow.py`), ưu tiên kiểm chứng claim của khách trước rồi quét các issue còn lại:
 
-- **Schema:** output validate theo `day09-l3a-output-v2` và từng trace event theo `day09-trace-event-v1`.
-- **Entity scope:** `output.case_id` phải khớp case đang chạy; `order_ids` gồm order được claim và order trong evidence.
-- **Evidence ownership:** ref chỉ lấy từ MCP response của chính case đó.
-- **Claim linkage:** mỗi claim trong input có một `claim_assessments` với verdict và ref.
-- **Confidence bounds:** kẹp về [0, 1]; không có evidence thì ≤ 0.30; `insufficient_evidence` thì ≤ 0.60.
-- **Responsibility/action consistency:** `resolution_actions` suy ra từ policy; `no_action` thì dùng `no_action_required`.
-- **Money totals:** chưa kiểm tra; `recommended_refund_brl` hiện cố định là `0.0`.
+| Issue | Điều kiện trên evidence | Refund |
+| --- | --- | --- |
+| canceled/unavailable_order_paid | `order_status` = canceled/unavailable và số đã capture − refund hoàn tất > 0 | phần còn lại |
+| late_delivery_seller | giao khách > ngày dự kiến và giao carrier > `shipping_limit_date` | phí vận chuyển (theo policy) |
+| late_delivery_logistics | giao khách > ngày dự kiến, seller giao carrier đúng hạn | phí vận chuyển (theo policy) |
+| duplicate_charge | ≥ 2 capture cùng payment reference và cùng số tiền | số tiền trùng |
+| refund_failed / refund_pending | refund event có status failed / pending, chưa có refund hoàn tất | số tiền refund lỗi / 0 |
+| payment_mismatch | tổng capture ≠ tổng (price + freight) | phần thu thừa |
+| valid_split_payment | nhiều payment, tổng khớp tổng đơn | 0 |
 
-Khi đóng gói, `submission.validate_artifacts` kiểm tra lại: đủ output cho mọi case trong case-set, không trùng `event_id`, không có event ngoài case-set, và không lộ Team API Key.
+Verifier kiểm tra trước khi ghi output:
+
+- **Schema:** output theo `day09-l3a-output-v2`, từng trace event theo `day09-trace-event-v1`.
+- **Status/refund/action:** `no_action` ⇒ refund 0 và action `no_action_required`; `recommended_refund_brl` = tổng `refund_lines`.
+- **Seller responsibility:** `party_type = seller` ⇒ `party_id` là seller id thật (seller giao trễ hoặc lấy từ evidence); nếu không có thì hạ confidence ≤ 0.6.
+- **Evidence linkage:** mọi ref cite đều có trong `tool_result_consumed` của cùng case; không có ref hỗ trợ ⇒ confidence ≤ 0.3.
+- **Claim linkage:** mỗi claim có một `claim_assessments`; `requested_full_refund` được đối chiếu với số tiền hoàn đề xuất.
+- **Confidence:** kẹp [0, 1]; khi kết luận khác claim của khách, confidence ≤ 0.75.
+
+`scripts/self_check.py` kiểm tra lại các invariant trên toàn bộ outputs và trace (và provenance/nhãn khi chạy với server local). `submission.validate_artifacts` kiểm tra khi đóng gói.
 
 ## 7. Reproducibility
 
-- **Model/config:** không dùng LLM; policy là luật xác định (deterministic). Cấu hình qua `.env`: `COMPETITION_API_URL`, `COMPETITION_TEAM_API_KEY`, `MCP_ENDPOINT`.
-- **Dependencies:** Python ≥ 3.11; `httpx2>=2,<3`, `jsonschema[format]>=4.25,<5`, `mcp>=2,<3`, `python-dotenv>=1.1,<2`. Chạy được trên CPU, không cần GPU.
-- **Concurrency:** chạy tuần tự từng case, mỗi case một MCP session.
-- **Random seed:** không có; chỉ `event_id` là ngẫu nhiên.
-- **Lệnh chạy:**
+- **Model/config:** không dùng LLM; policy là luật xác định. Cấu hình qua `.env`: `COMPETITION_API_URL`, `COMPETITION_TEAM_API_KEY`, `MCP_ENDPOINT` (biến môi trường cùng tên ghi đè `.env`).
+- **Dependencies:** Python ≥ 3.11; `httpx2`, `jsonschema[format]`, `mcp` 2.x, `python-dotenv`. Chỉ cần CPU.
+- **Concurrency:** tuần tự từng case; không có random seed ngoài `event_id`.
+- **Server local để phát triển:** `scripts/local_mcp_server.py` cung cấp đủ 10 tool cùng contract, dữ liệu mô phỏng theo schema Olist, audit log và nhãn kỳ vọng trong `.local_mcp/`. Ref của server local **không hợp lệ** với server thi.
+- **Lệnh chạy với server thi:**
 
 ```bash
-python3.11 -m venv .venv && source .venv/bin/activate
-python -m pip install -e ".[dev]"
+source .venv/bin/activate
 day09 validate-inputs
+rm -f outputs/*.json traces/trace.jsonl
 day09 run
 day09 validate
+python scripts/self_check.py
 day09 package --output dist/submission.zip
 ```
 

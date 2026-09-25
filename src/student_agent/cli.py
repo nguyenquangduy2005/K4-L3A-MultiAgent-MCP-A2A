@@ -74,6 +74,9 @@ async def _run_one_case(
             flush=True,
         )
 
+        # Event của lần thử thất bại bị bỏ, chỉ ghi trace khi case thành công.
+        trace.begin_case()
+
         try:
             # Mỗi case sử dụng một MCP session riêng.
             async with connect_gateway(
@@ -121,6 +124,7 @@ async def _run_one_case(
                 )
 
                 temporary.replace(target)
+                trace.commit_case()
 
                 print(
                     f"[OK] {case_id}",
@@ -130,6 +134,7 @@ async def _run_one_case(
                 return True
 
         except Exception as exc:
+            trace.discard_case()
             print(
                 f"[WARN] {case_id} attempt "
                 f"{attempt}/{max_attempts} failed: "
@@ -219,7 +224,7 @@ async def _run(root: Path) -> None:
             failed.append(case_id)
 
     print(
-        f"\n===== RUN COMPLETE =====",
+        "\n===== RUN COMPLETE =====",
         flush=True,
     )
 
